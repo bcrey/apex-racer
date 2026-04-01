@@ -37,6 +37,28 @@ const checkpoints = [
   {x: -1000, y: 1000}
 ];
 
+const TRACK_WIDTH = 400;
+const HALF_TRACK_WIDTH = TRACK_WIDTH / 2;
+const START_FINISH_LINE_WIDTH = 20;
+const START_FINISH_X = 900;
+const START_FINISH_Y = 0;
+
+type RemotePlayer = {
+  id: string;
+  initials: string;
+  color: string;
+  x: number;
+  y: number;
+  angle: number;
+  vx: number;
+  vy: number;
+};
+
+type LeaderboardEntry = {
+  initials: string;
+  timeMs: number;
+};
+
 function getDistanceToTrack(p: {x: number, y: number}) {
   let minDistSq = Infinity;
   for (let i = 0; i < trackPoints.length - 1; i++) {
@@ -170,18 +192,87 @@ function drawCar(ctx: CanvasRenderingContext2D, x: number, y: number, angle: num
   ctx.restore();
 }
 
+function drawDriverTag(ctx: CanvasRenderingContext2D, x: number, y: number, initials: string, color: string) {
+  ctx.save();
+  ctx.translate(x, y - 44);
+  ctx.font = '700 14px system-ui';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+
+  const textWidth = ctx.measureText(initials).width;
+  const tagWidth = Math.max(42, textWidth + 20);
+  const tagHeight = 24;
+  const pointerHeight = 8;
+  const tagTop = -tagHeight - pointerHeight;
+
+  ctx.fillStyle = 'rgba(2, 6, 23, 0.92)';
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(-tagWidth / 2, tagTop, tagWidth, tagHeight, 12);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(-7, -pointerHeight);
+  ctx.lineTo(0, 0);
+  ctx.lineTo(7, -pointerHeight);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillText(initials, 0, tagTop + tagHeight / 2);
+  ctx.restore();
+}
+
+function sanitizeInitials(value: string) {
+  return value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3);
+}
+
+async function fetchLeaderboard() {
+  const response = await fetch('/api/leaderboard');
+  if (!response.ok) {
+    throw new Error('Unable to load leaderboard');
+  }
+
+  const data = await response.json() as { entries?: LeaderboardEntry[] };
+  return data.entries ?? [];
+}
+
+async function submitLapTime(initials: string, timeMs: number) {
+  const response = await fetch('/api/leaderboard', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ initials, timeMs }),
+  });
+
+  if (!response.ok) {
+    throw new Error('Unable to save lap time');
+  }
+
+  const data = await response.json() as { entries?: LeaderboardEntry[] };
+  return data.entries ?? [];
+}
+
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [speedMph, setSpeedMph] = useState(0);
   const [lap, setLap] = useState(1);
   const [lapTime, setLapTime] = useState(0);
   const [bestLap, setBestLap] = useState<number | null>(null);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [leaderboardStatus, setLeaderboardStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [playerInitials, setPlayerInitials] = useState('');
+  const [initialsInput, setInitialsInput] = useState('');
 
   // --- Multiplayer State ---
   const wsRef = useRef<WebSocket | null>(null);
   const myIdRef = useRef<string | null>(null);
   const myColorRef = useRef<string>('#06b6d4');
-  const remotePlayers = useRef<Map<string, any>>(new Map());
+  const remotePlayers = useRef<Map<string, RemotePlayer>>(new Map());
   const lastSendTime = useRef<number>(0);
 
   const keys = useRef<{ [key: string]: boolean }>({});
@@ -197,9 +288,48 @@ export default function App() {
   });
 
   useEffect(() => {
+    if (!playerInitials) {
+      return;
+    }
+
+    let cancelled = false;
+
+    const loadLeaderboard = async () => {
+      try {
+        setLeaderboardStatus('loading');
+        const entries = await fetchLeaderboard();
+        if (!cancelled) {
+          setLeaderboard(entries);
+          setLeaderboardStatus('ready');
+        }
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setLeaderboardStatus('error');
+        }
+      }
+    };
+
+    const saveLapTime = async (timeMs: number) => {
+      try {
+        const entries = await submitLapTime(playerInitials, timeMs);
+        if (!cancelled) {
+          setLeaderboard(entries);
+          setLeaderboardStatus('ready');
+        }
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setLeaderboardStatus('error');
+        }
+      }
+    };
+
+    void loadLeaderboard();
+
     // --- WebSocket Setup ---
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
+    const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}`;
     const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
@@ -211,7 +341,8 @@ export default function App() {
           myColorRef.current = msg.color;
           car.current.x = msg.x;
           car.current.y = msg.y;
-          msg.players.forEach((p: any) => {
+          remotePlayers.current.clear();
+          msg.players.forEach((p: RemotePlayer) => {
             if (p.id !== msg.id) remotePlayers.current.set(p.id, p);
           });
         } else if (msg.type === 'join') {
@@ -225,6 +356,9 @@ export default function App() {
             p.vx = msg.vx;
             p.vy = msg.vy;
           }
+        } else if (msg.type === 'leaderboard') {
+          setLeaderboard(msg.entries ?? []);
+          setLeaderboardStatus('ready');
         } else if (msg.type === 'leave') {
           remotePlayers.current.delete(msg.id);
         }
@@ -233,8 +367,14 @@ export default function App() {
       }
     };
 
-    const handleKeyDown = (e: KeyboardEvent) => { keys.current[e.key.toLowerCase()] = true; };
-    const handleKeyUp = (e: KeyboardEvent) => { keys.current[e.key.toLowerCase()] = false; };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      keys.current[e.key.toLowerCase()] = true;
+      if (e.code === 'Space') keys.current.space = true;
+    };
+    const handleKeyUp = (e: KeyboardEvent) => {
+      keys.current[e.key.toLowerCase()] = false;
+      if (e.code === 'Space') keys.current.space = false;
+    };
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
 
@@ -261,9 +401,10 @@ export default function App() {
 
       // --- Physics ---
       const isAccelerating = keys.current['arrowup'] || keys.current['w'];
-      const isBraking = keys.current['arrowdown'] || keys.current['s'];
+      const isBraking = keys.current['arrowdown'] || keys.current['s'] || keys.current.space;
       const isTurningLeft = keys.current['arrowleft'] || keys.current['a'];
       const isTurningRight = keys.current['arrowright'] || keys.current['d'];
+      const steerInput = (isTurningRight ? 1 : 0) - (isTurningLeft ? 1 : 0);
 
       const forwardX = Math.cos(c.angle);
       const forwardY = Math.sin(c.angle);
@@ -274,27 +415,36 @@ export default function App() {
       const lateralSpeed = c.vx * rightX + c.vy * rightY;
 
       const dist = getDistanceToTrack(c);
-      const isOnTrack = dist < 200;
+      const isOnTrack = dist < HALF_TRACK_WIDTH;
+      const isDrifting = isOnTrack && isBraking && steerInput !== 0 && Math.abs(speed) > 2.5;
 
       const engineForce = isOnTrack ? 0.6 : 0.3;
-      const brakingForce = isOnTrack ? 0.8 : 0.4;
-      const turnSpeed = 0.05;
-      const drag = isOnTrack ? 0.97 : 0.90;
-      const grip = isOnTrack ? 0.15 : 0.05;
+      const brakingForce = isOnTrack ? (isDrifting ? 0.22 : 0.8) : 0.4;
+      const turnSpeed = isDrifting ? 0.072 : 0.05;
+      const drag = isOnTrack ? (isDrifting ? 0.985 : 0.97) : 0.90;
+      const grip = isOnTrack ? (isDrifting ? 0.045 : 0.15) : 0.05;
 
       if (isAccelerating) {
         c.vx += forwardX * engineForce;
         c.vy += forwardY * engineForce;
       }
       if (isBraking) {
-        c.vx -= forwardX * brakingForce;
-        c.vy -= forwardY * brakingForce;
+        const brakeAmount = Math.min(Math.abs(speed), brakingForce);
+        const brakeDirection = speed === 0 ? 0 : Math.sign(speed);
+        c.vx -= forwardX * brakeAmount * brakeDirection;
+        c.vy -= forwardY * brakeAmount * brakeDirection;
       }
 
       if (Math.abs(speed) > 0.5) {
         const turnDir = speed > 0 ? 1 : -1;
         if (isTurningLeft) c.angle -= turnSpeed * turnDir;
         if (isTurningRight) c.angle += turnSpeed * turnDir;
+      }
+
+      if (isDrifting) {
+        const driftPush = Math.min(Math.abs(speed) * 0.03, 0.75);
+        c.vx += rightX * steerInput * driftPush;
+        c.vy += rightY * steerInput * driftPush;
       }
 
       // Apply lateral friction (grip)
@@ -305,11 +455,18 @@ export default function App() {
       c.vx *= drag;
       c.vy *= drag;
 
+      // Remove any backward motion so brake input acts like a drift brake, not reverse.
+      const nextForwardSpeed = c.vx * forwardX + c.vy * forwardY;
+      if (nextForwardSpeed < 0) {
+        c.vx -= forwardX * nextForwardSpeed;
+        c.vy -= forwardY * nextForwardSpeed;
+      }
+
       c.x += c.vx;
       c.y += c.vy;
 
       // Skid marks
-      if (Math.abs(lateralSpeed) > 3 && isOnTrack) {
+      if (Math.abs(lateralSpeed) > (isDrifting ? 1.5 : 3) && isOnTrack) {
         skidMarks.current.push({
           x: c.x + rightX * -11 - forwardX * 16,
           y: c.y + rightY * -11 - forwardY * 16,
@@ -351,10 +508,15 @@ export default function App() {
           state.nextCheckpoint++;
         }
       } else {
-        if (prevX < 0 && c.x >= 0 && Math.abs(c.y) < 200) {
+        if (
+          prevX < START_FINISH_X &&
+          c.x >= START_FINISH_X &&
+          Math.abs(c.y - START_FINISH_Y) < HALF_TRACK_WIDTH
+        ) {
           // Lap complete!
           const currentLapTime = time - state.lapStartTime;
           setBestLap(prev => prev === null ? currentLapTime : Math.min(prev, currentLapTime));
+          void saveLapTime(currentLapTime);
           setLap(l => l + 1);
           state.nextCheckpoint = 0;
           state.lapStartTime = time;
@@ -404,7 +566,7 @@ export default function App() {
       for (let i = 1; i < trackPoints.length; i++) {
         ctx.lineTo(trackPoints[i].x, trackPoints[i].y);
       }
-      ctx.lineWidth = 400;
+      ctx.lineWidth = TRACK_WIDTH;
       ctx.strokeStyle = '#333';
       ctx.stroke();
 
@@ -422,17 +584,20 @@ export default function App() {
 
       // Start/Finish line
       ctx.save();
-      ctx.translate(trackPoints[0].x, trackPoints[0].y);
+      ctx.translate(START_FINISH_X, START_FINISH_Y);
       const dx = trackPoints[1].x - trackPoints[0].x;
       const dy = trackPoints[1].y - trackPoints[0].y;
+      const startFinishHalfHeight = HALF_TRACK_WIDTH;
+      const startFinishTop = -startFinishHalfHeight;
+      const startFinishHeight = startFinishHalfHeight * 2;
       ctx.rotate(Math.atan2(dy, dx));
       
       ctx.fillStyle = '#fff';
-      ctx.fillRect(-10, -200, 20, 400);
+      ctx.fillRect(-START_FINISH_LINE_WIDTH / 2, startFinishTop, START_FINISH_LINE_WIDTH, startFinishHeight);
       ctx.fillStyle = '#000';
-      for (let i = -200; i < 200; i += 40) {
-        ctx.fillRect(-10, i, 10, 20);
-        ctx.fillRect(0, i + 20, 10, 20);
+      for (let i = startFinishTop; i < startFinishHalfHeight; i += 40) {
+        ctx.fillRect(-START_FINISH_LINE_WIDTH / 2, i, START_FINISH_LINE_WIDTH / 2, 20);
+        ctx.fillRect(0, i + 20, START_FINISH_LINE_WIDTH / 2, 20);
       }
       ctx.restore();
 
@@ -447,6 +612,7 @@ export default function App() {
       // Remote Cars
       remotePlayers.current.forEach(p => {
         drawCar(ctx, p.x, p.y, p.angle, p.color, false);
+        drawDriverTag(ctx, p.x, p.y, p.initials, p.color);
       });
 
       // Local Car
@@ -459,13 +625,14 @@ export default function App() {
     animationId = requestAnimationFrame(loop);
 
     return () => {
+      cancelled = true;
       if (wsRef.current) wsRef.current.close();
       cancelAnimationFrame(animationId);
       window.removeEventListener('resize', resize);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
-  }, []);
+  }, [playerInitials]);
 
   const formatTime = (ms: number) => {
     const totalSeconds = Math.floor(ms / 1000);
@@ -473,6 +640,16 @@ export default function App() {
     const seconds = totalSeconds % 60;
     const hundredths = Math.floor((ms % 1000) / 10);
     return `${minutes}:${seconds.toString().padStart(2, '0')}.${hundredths.toString().padStart(2, '0')}`;
+  };
+
+  const handleJoin = (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const nextInitials = sanitizeInitials(initialsInput);
+    if (nextInitials.length === 0) {
+      return;
+    }
+
+    setPlayerInitials(nextInitials);
   };
 
   return (
@@ -501,6 +678,28 @@ export default function App() {
               <span className="text-lg font-bold text-green-400">{formatTime(bestLap)}</span>
             </div>
           )}
+          <div className="pt-3 mt-3 border-t border-white/10">
+            <div className="text-gray-400 uppercase text-xs tracking-widest mb-2">Top 3 Fastest</div>
+            <div className="space-y-2">
+              {[0, 1, 2].map((index) => {
+                const entry = leaderboard[index];
+                return (
+                  <div key={index} className="flex justify-between items-center gap-6 text-sm">
+                    <span className="text-white/80">
+                      {`#${index + 1} `}
+                      <span className="font-bold">{entry?.initials ?? '---'}</span>
+                    </span>
+                    <span className={entry ? 'font-bold text-cyan-100' : 'text-white/30'}>
+                      {entry ? formatTime(entry.timeMs) : '--:--.--'}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            {leaderboardStatus === 'error' && (
+              <p className="mt-2 text-xs text-rose-300">Leaderboard unavailable</p>
+            )}
+          </div>
         </div>
       </div>
 
@@ -551,6 +750,40 @@ export default function App() {
           <span className="font-bold text-sm uppercase tracking-wider">Gas</span>
         </button>
       </div>
+
+      {!playerInitials && (
+        <div className="absolute inset-0 flex items-center justify-center bg-slate-950/55 backdrop-blur-sm px-6">
+          <form
+            onSubmit={handleJoin}
+            className="w-full max-w-sm rounded-3xl border border-white/10 bg-black/70 p-7 text-white shadow-2xl"
+          >
+            <p className="text-xs font-bold uppercase tracking-[0.35em] text-rose-300">Join Race</p>
+            <h2 className="mt-3 text-3xl font-black italic tracking-tight text-white">Enter Your Initials</h2>
+            <p className="mt-3 text-sm text-slate-300">
+              Pick up to 3 letters so other drivers can see who is on the track.
+            </p>
+
+            <input
+              autoFocus
+              autoCapitalize="characters"
+              className="mt-6 w-full rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-center text-3xl font-black uppercase tracking-[0.45em] text-cyan-100 outline-none transition focus:border-cyan-400"
+              maxLength={3}
+              onChange={(event) => setInitialsInput(sanitizeInitials(event.target.value))}
+              placeholder="ABC"
+              spellCheck={false}
+              value={initialsInput}
+            />
+
+            <button
+              className="mt-5 w-full rounded-2xl bg-gradient-to-r from-rose-500 to-orange-400 px-4 py-3 text-sm font-black uppercase tracking-[0.3em] text-white disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={initialsInput.length === 0}
+              type="submit"
+            >
+              Start Engines
+            </button>
+          </form>
+        </div>
+      )}
     </div>
   );
 }

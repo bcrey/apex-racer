@@ -1,15 +1,178 @@
+import dotenv from 'dotenv';
 import express from 'express';
-import { WebSocketServer, WebSocket } from 'ws';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import postgres from 'postgres';
+import { createServer as createViteServer } from 'vite';
+import { WebSocketServer, WebSocket } from 'ws';
+
+dotenv.config({ path: '.env.local', quiet: true });
+dotenv.config({ quiet: true });
+
+const START_FINISH_X = 900;
+const STARTING_GRID_OFFSET = 140;
+const PORT = 3004;
+
+type Player = {
+  id: string;
+  slotIndex: number;
+  initials: string;
+  x: number;
+  y: number;
+  angle: number;
+  vx: number;
+  vy: number;
+  color: string;
+};
+
+type LeaderboardEntry = {
+  initials: string;
+  timeMs: number;
+};
+
+const colors = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899', '#84cc16', '#14b8a6'];
+
+function createSqlClient(databaseUrl: string) {
+  const match = databaseUrl.match(/^postgres(?:ql)?:\/\/([^:]+):(.+)@([^:/]+):(\d+)\/(.+)$/);
+  if (!match) {
+    throw new Error('DATABASE_URL format is invalid');
+  }
+
+  const [, username, password, host, port, databasePath] = match;
+  const [database] = databasePath.split('?');
+  const numericPort = Number(port);
+  const isSupabaseTransactionPooler = host.includes('.pooler.supabase.com') && numericPort === 6543;
+
+  return postgres({
+    host,
+    port: numericPort,
+    database,
+    username,
+    password,
+    ssl: 'require',
+    prepare: !isSupabaseTransactionPooler,
+  });
+}
+
+const sql = process.env.DATABASE_URL
+  ? createSqlClient(process.env.DATABASE_URL)
+  : null;
+
+let leaderboardReady = false;
+
+function sanitizeInitials(value: string | null | undefined) {
+  const cleaned = (value ?? '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3);
+  return cleaned || '???';
+}
+
+async function ensureLeaderboardTable() {
+  if (!sql) {
+    return;
+  }
+
+  await sql`
+    create table if not exists leaderboard_laps (
+      id bigserial primary key,
+      initials varchar(3) not null,
+      time_ms integer not null check (time_ms > 0),
+      created_at timestamptz not null default now()
+    )
+  `;
+
+  await sql`
+    create index if not exists leaderboard_laps_time_ms_idx
+    on leaderboard_laps (time_ms asc, created_at asc)
+  `;
+
+  leaderboardReady = true;
+}
+
+async function getTopLapTimes() {
+  if (!sql || !leaderboardReady) {
+    return [] as LeaderboardEntry[];
+  }
+
+  const rows = await sql<LeaderboardEntry[]>`
+    select initials, time_ms as "timeMs"
+    from leaderboard_laps
+    order by time_ms asc, created_at asc
+    limit 3
+  `;
+
+  return rows;
+}
+
+async function recordLapTime(initials: string, timeMs: number) {
+  if (!sql || !leaderboardReady) {
+    throw new Error('Leaderboard database is not ready');
+  }
+
+  await sql`
+    insert into leaderboard_laps (initials, time_ms)
+    values (${initials}, ${timeMs})
+  `;
+
+  return getTopLapTimes();
+}
 
 async function startServer() {
+  if (sql) {
+    try {
+      await ensureLeaderboardTable();
+      console.log('Leaderboard database ready');
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        'code' in error &&
+        error.code === 'EHOSTUNREACH' &&
+        process.env.DATABASE_URL?.includes('.supabase.co:5432')
+      ) {
+        console.error(
+          'Failed to initialize leaderboard database. This Supabase direct connection uses IPv6, but this environment cannot reach IPv6. Replace DATABASE_URL with the Supabase Session Pooler connection string from the Supabase dashboard Connect panel.',
+        );
+      } else {
+        console.error('Failed to initialize leaderboard database', error);
+      }
+    }
+  } else {
+    console.warn('DATABASE_URL is not set. Leaderboard persistence is disabled.');
+  }
+
   const app = express();
-  const PORT = 3004;
+  app.use(express.json());
+  let sendLeaderboardToClients: ((entries: LeaderboardEntry[]) => void) | null = null;
 
   // API routes FIRST
-  app.get('/api/health', (req, res) => {
+  app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok' });
+  });
+
+  app.get('/api/leaderboard', async (_req, res) => {
+    try {
+      const entries = await getTopLapTimes();
+      res.json({ entries });
+    } catch (error) {
+      console.error('Unable to load leaderboard', error);
+      res.status(500).json({ error: 'Unable to load leaderboard' });
+    }
+  });
+
+  app.post('/api/leaderboard', async (req, res) => {
+    const initials = sanitizeInitials(req.body?.initials);
+    const timeMs = Math.round(Number(req.body?.timeMs));
+
+    if (!Number.isFinite(timeMs) || timeMs <= 0) {
+      res.status(400).json({ error: 'A valid lap time is required' });
+      return;
+    }
+
+    try {
+      const entries = await recordLapTime(initials, timeMs);
+      sendLeaderboardToClients?.(entries);
+      res.status(201).json({ entries });
+    } catch (error) {
+      console.error('Unable to save leaderboard entry', error);
+      res.status(503).json({ error: 'Leaderboard unavailable' });
+    }
   });
 
   // Vite middleware for development
@@ -22,7 +185,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -31,30 +194,46 @@ async function startServer() {
     console.log(`Server running on http://localhost:${PORT}`);
   });
 
-  // WebSocket Server
   const wss = new WebSocketServer({ server });
-  const players = new Map<string, any>();
-  const colors = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899', '#84cc16', '#14b8a6'];
+  const players = new Map<string, Player>();
+  sendLeaderboardToClients = (entries) => {
+    const leaderboardMsg = JSON.stringify({ type: 'leaderboard', entries });
+    wss.clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) {
+        client.send(leaderboardMsg);
+      }
+    });
+  };
 
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
     const id = Math.random().toString(36).substring(2, 9);
-    
-    const usedSlots = new Set(Array.from(players.values()).map(p => p.slotIndex));
+    const requestUrl = new URL(req.url ?? '/', 'http://localhost');
+    const initials = sanitizeInitials(requestUrl.searchParams.get('initials'));
+
+    const usedSlots = new Set(Array.from(players.values()).map((player) => player.slotIndex));
     let slotIndex = 0;
     while (usedSlots.has(slotIndex)) {
       slotIndex++;
     }
 
     const color = colors[slotIndex % colors.length];
-    const startX = -Math.floor(slotIndex / 2) * 120;
+    const startX = START_FINISH_X - STARTING_GRID_OFFSET - Math.floor(slotIndex / 2) * 120;
     const startY = (slotIndex % 2 === 0) ? -80 : 80;
-    
-    players.set(id, { id, slotIndex, x: startX, y: startY, angle: 0, vx: 0, vy: 0, color });
 
-    ws.send(JSON.stringify({ type: 'init', id, color, x: startX, y: startY, players: Array.from(players.values()) }));
+    players.set(id, { id, slotIndex, initials, x: startX, y: startY, angle: 0, vx: 0, vy: 0, color });
+
+    ws.send(JSON.stringify({
+      type: 'init',
+      id,
+      color,
+      initials,
+      x: startX,
+      y: startY,
+      players: Array.from(players.values()),
+    }));
 
     const joinMsg = JSON.stringify({ type: 'join', player: players.get(id) });
-    wss.clients.forEach(client => {
+    wss.clients.forEach((client) => {
       if (client !== ws && client.readyState === WebSocket.OPEN) {
         client.send(joinMsg);
       }
@@ -62,33 +241,54 @@ async function startServer() {
 
     ws.on('message', (data) => {
       try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === 'update') {
-          const p = players.get(id);
-          if (p) {
-            p.x = msg.x;
-            p.y = msg.y;
-            p.angle = msg.angle;
-            p.vx = msg.vx;
-            p.vy = msg.vy;
-            
-            const updateMsg = JSON.stringify({ type: 'update', id, x: p.x, y: p.y, angle: p.angle, vx: p.vx, vy: p.vy });
-            wss.clients.forEach(client => {
-              if (client !== ws && client.readyState === WebSocket.OPEN) {
-                client.send(updateMsg);
-              }
-            });
-          }
+        const msg = JSON.parse(data.toString()) as {
+          type?: string;
+          x?: number;
+          y?: number;
+          angle?: number;
+          vx?: number;
+          vy?: number;
+        };
+
+        if (msg.type !== 'update') {
+          return;
         }
-      } catch (e) {
-        console.error('Message error', e);
+
+        const player = players.get(id);
+        if (!player) {
+          return;
+        }
+
+        player.x = msg.x ?? player.x;
+        player.y = msg.y ?? player.y;
+        player.angle = msg.angle ?? player.angle;
+        player.vx = msg.vx ?? player.vx;
+        player.vy = msg.vy ?? player.vy;
+
+        const updateMsg = JSON.stringify({
+          type: 'update',
+          id,
+          x: player.x,
+          y: player.y,
+          angle: player.angle,
+          vx: player.vx,
+          vy: player.vy,
+        });
+
+        wss.clients.forEach((client) => {
+          if (client !== ws && client.readyState === WebSocket.OPEN) {
+            client.send(updateMsg);
+          }
+        });
+      } catch (error) {
+        console.error('Message error', error);
       }
     });
 
     ws.on('close', () => {
       players.delete(id);
       const leaveMsg = JSON.stringify({ type: 'leave', id });
-      wss.clients.forEach(client => {
+      wss.clients.forEach((client) => {
         if (client.readyState === WebSocket.OPEN) {
           client.send(leaveMsg);
         }
