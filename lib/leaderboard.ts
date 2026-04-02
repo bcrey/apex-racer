@@ -5,8 +5,14 @@ export type LeaderboardEntry = {
   timeMs: number;
 };
 
+export type LeaderboardData = {
+  allTime: LeaderboardEntry[];
+  today: LeaderboardEntry[];
+};
+
 let sqlClient: postgres.Sql | null | undefined;
 let leaderboardReadyPromise: Promise<void> | null = null;
+const LEADERBOARD_LIMIT = 5;
 
 export function hasLeaderboardDatabase() {
   return Boolean(process.env.DATABASE_URL);
@@ -51,6 +57,17 @@ export function sanitizeInitials(value: string | null | undefined) {
   return cleaned || '???';
 }
 
+export function sanitizeTimeZone(value: string | null | undefined) {
+  const candidate = typeof value === 'string' && value.trim() ? value.trim() : 'UTC';
+
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate }).format(new Date());
+    return candidate;
+  } catch {
+    return 'UTC';
+  }
+}
+
 export function isDirectSupabaseIpv6Error(error: unknown) {
   return (
     typeof error === 'object' &&
@@ -93,25 +110,45 @@ export async function ensureLeaderboardTable() {
   }
 }
 
-export async function getTopLapTimes() {
+function emptyLeaderboardData(): LeaderboardData {
+  return {
+    allTime: [],
+    today: [],
+  };
+}
+
+export async function getLeaderboardData(timeZone: string) {
   const sql = getSqlClient();
   if (!sql) {
-    return [] as LeaderboardEntry[];
+    return emptyLeaderboardData();
   }
 
   await ensureLeaderboardTable();
+  const safeTimeZone = sanitizeTimeZone(timeZone);
 
-  const rows = await sql<LeaderboardEntry[]>`
-    select initials, time_ms as "timeMs"
-    from leaderboard_laps
-    order by time_ms asc, created_at asc
-    limit 3
-  `;
+  const [allTime, today] = await Promise.all([
+    sql<LeaderboardEntry[]>`
+      select initials, time_ms as "timeMs"
+      from leaderboard_laps
+      order by time_ms asc, created_at asc
+      limit ${LEADERBOARD_LIMIT}
+    `,
+    sql<LeaderboardEntry[]>`
+      select initials, time_ms as "timeMs"
+      from leaderboard_laps
+      where (created_at at time zone ${safeTimeZone})::date = (now() at time zone ${safeTimeZone})::date
+      order by time_ms asc, created_at asc
+      limit ${LEADERBOARD_LIMIT}
+    `,
+  ]);
 
-  return rows;
+  return {
+    allTime,
+    today,
+  } satisfies LeaderboardData;
 }
 
-export async function recordLapTime(initials: string, timeMs: number) {
+export async function recordLapTime(initials: string, timeMs: number, timeZone: string) {
   const sql = getSqlClient();
   if (!sql) {
     throw new Error('Leaderboard database is not configured');
@@ -124,5 +161,22 @@ export async function recordLapTime(initials: string, timeMs: number) {
     values (${initials}, ${timeMs})
   `;
 
-  return getTopLapTimes();
+  return getLeaderboardData(timeZone);
+}
+
+export async function resetLeaderboardData(timeZone: string) {
+  const sql = getSqlClient();
+  if (!sql) {
+    throw new Error('Leaderboard database is not configured');
+  }
+
+  await ensureLeaderboardTable();
+  const safeTimeZone = sanitizeTimeZone(timeZone);
+
+  await sql`
+    delete from leaderboard_laps
+    where (created_at at time zone ${safeTimeZone})::date = (now() at time zone ${safeTimeZone})::date
+  `;
+
+  return getLeaderboardData(timeZone);
 }

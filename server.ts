@@ -2,11 +2,12 @@ import dotenv from 'dotenv';
 import express from 'express';
 import {
   ensureLeaderboardTable,
-  getTopLapTimes,
+  getLeaderboardData,
   isDirectSupabaseIpv6Error,
   recordLapTime,
+  resetLeaderboardData,
   sanitizeInitials,
-  type LeaderboardEntry,
+  sanitizeTimeZone,
 } from './lib/leaderboard';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
@@ -53,17 +54,20 @@ async function startServer() {
 
   const app = express();
   app.use(express.json());
-  let sendLeaderboardToClients: ((entries: LeaderboardEntry[]) => void) | null = null;
+  let sendLeaderboardToClients: (() => void) | null = null;
 
   // API routes FIRST
   app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok' });
   });
 
-  app.get('/api/leaderboard', async (_req, res) => {
+  app.get('/api/leaderboard', async (req, res) => {
     try {
-      const entries = await getTopLapTimes();
-      res.json({ entries });
+      const timeZone = sanitizeTimeZone(
+        typeof req.query.timeZone === 'string' ? req.query.timeZone : undefined,
+      );
+      const leaderboard = await getLeaderboardData(timeZone);
+      res.json({ leaderboard });
     } catch (error) {
       console.error('Unable to load leaderboard', error);
       res.status(500).json({ error: 'Unable to load leaderboard' });
@@ -80,12 +84,27 @@ async function startServer() {
     }
 
     try {
-      const entries = await recordLapTime(initials, timeMs);
-      sendLeaderboardToClients?.(entries);
-      res.status(201).json({ entries });
+      const timeZone = sanitizeTimeZone(req.body?.timeZone);
+      const leaderboard = await recordLapTime(initials, timeMs, timeZone);
+      sendLeaderboardToClients?.();
+      res.status(201).json({ leaderboard });
     } catch (error) {
       console.error('Unable to save leaderboard entry', error);
       res.status(503).json({ error: 'Leaderboard unavailable' });
+    }
+  });
+
+  app.delete('/api/leaderboard', async (req, res) => {
+    try {
+      const timeZone = sanitizeTimeZone(
+        typeof req.query.timeZone === 'string' ? req.query.timeZone : undefined,
+      );
+      const leaderboard = await resetLeaderboardData(timeZone);
+      sendLeaderboardToClients?.();
+      res.json({ leaderboard });
+    } catch (error) {
+      console.error('Unable to reset today leaderboard', error);
+      res.status(503).json({ error: 'Unable to reset today leaderboard' });
     }
   });
 
@@ -110,8 +129,8 @@ async function startServer() {
 
   const wss = new WebSocketServer({ server });
   const players = new Map<string, Player>();
-  sendLeaderboardToClients = (entries) => {
-    const leaderboardMsg = JSON.stringify({ type: 'leaderboard', entries });
+  sendLeaderboardToClients = () => {
+    const leaderboardMsg = JSON.stringify({ type: 'leaderboard' });
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(leaderboardMsg);

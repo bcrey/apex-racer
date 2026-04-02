@@ -72,13 +72,55 @@ type CarUpdate = Pick<RemotePlayer, 'id' | 'x' | 'y' | 'angle' | 'vx' | 'vy'>;
 type MultiplayerConnection = {
   close: () => void;
   sendUpdate: (update: CarUpdate) => void;
-  broadcastLeaderboard: (entries: LeaderboardEntry[]) => void;
+  broadcastLeaderboard: () => void;
 };
 
 type LeaderboardEntry = {
   initials: string;
   timeMs: number;
 };
+
+type LeaderboardData = {
+  allTime: LeaderboardEntry[];
+  today: LeaderboardEntry[];
+};
+
+type ConfettiParticle = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  rotation: number;
+  spin: number;
+  life: number;
+  size: number;
+  color: string;
+  shape: 'rect' | 'circle';
+};
+
+type ExplosionParticle = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  size: number;
+  color: string;
+};
+
+const MOBILE_HUD_BREAKPOINT = 768;
+const LEADERBOARD_DISPLAY_COUNT = 5;
+const FPS_AVERAGE_WINDOW_MS = 10_000;
+const FPS_DISPLAY_UPDATE_MS = 250;
+const PODIUM_EMOJIS = ['🥇', '🥈', '🥉'] as const;
+const CONFETTI_COLORS = ['#f43f5e', '#f59e0b', '#fde047', '#22c55e', '#38bdf8', '#a78bfa'];
+const PODIUM_CONFETTI_COLORS = [
+  ['#facc15', '#fde047', '#fef3c7', '#f59e0b'],
+  ['#e2e8f0', '#cbd5e1', '#94a3b8', '#f8fafc'],
+  ['#f97316', '#fdba74', '#fed7aa', '#7c2d12'],
+] as const;
+const EXPLOSION_COLORS = ['#ffffff', '#fde047', '#fb7185', '#f97316', '#ef4444'] as const;
+const EASTER_EGG_INITIALS = 'SLY';
 
 function getDistanceToTrack(p: {x: number, y: number}) {
   let minDistSq = Infinity;
@@ -260,6 +302,101 @@ function getGridPlacement(slotIndex: number) {
   };
 }
 
+function getEmptyLeaderboardData(): LeaderboardData {
+  return {
+    allTime: [],
+    today: [],
+  };
+}
+
+function getLeaderboardPlacement(
+  timeMs: number,
+  entries: LeaderboardEntry[],
+  placementLimit = LEADERBOARD_DISPLAY_COUNT,
+) {
+  if (!Number.isFinite(timeMs) || timeMs <= 0) {
+    return null;
+  }
+
+  let placement = 0;
+  while (placement < entries.length && timeMs > entries[placement].timeMs) {
+    placement++;
+  }
+
+  if (placement < placementLimit) {
+    return placement;
+  }
+
+  return entries.length < placementLimit ? entries.length : null;
+}
+
+function getBestLeaderboardPlacement(
+  timeMs: number,
+  leaderboard: LeaderboardData,
+  placementLimit = LEADERBOARD_DISPLAY_COUNT,
+) {
+  const placements = [
+    getLeaderboardPlacement(timeMs, leaderboard.allTime, placementLimit),
+    getLeaderboardPlacement(timeMs, leaderboard.today, placementLimit),
+  ].filter((placement): placement is number => placement !== null);
+
+  if (placements.length === 0) {
+    return null;
+  }
+
+  return Math.min(...placements);
+}
+
+function getPlacementMedal(placement: number | null) {
+  return placement === null ? null : PODIUM_EMOJIS[placement] ?? null;
+}
+
+function createConfettiBurst(
+  side: 'left' | 'right',
+  viewportWidth: number,
+  viewportHeight: number,
+  colors: readonly string[] = CONFETTI_COLORS,
+): ConfettiParticle[] {
+  const originX = side === 'left' ? -24 : viewportWidth + 24;
+  const direction = side === 'left' ? 1 : -1;
+  const originY = viewportHeight * (0.62 + Math.random() * 0.14);
+
+  return Array.from({ length: 28 }, (_, index) => {
+    const size = 6 + Math.random() * 8;
+
+    return {
+      x: originX + (side === 'left' ? -Math.random() * 18 : Math.random() * 18),
+      y: originY + (Math.random() - 0.5) * 72,
+      vx: direction * (7 + Math.random() * 7),
+      vy: -12 - Math.random() * 10,
+      rotation: Math.random() * Math.PI * 2,
+      spin: (Math.random() - 0.5) * 0.4,
+      life: 72 + Math.random() * 36,
+      size,
+      color: colors[(index + Math.floor(Math.random() * colors.length)) % colors.length],
+      shape: Math.random() > 0.25 ? 'rect' : 'circle',
+    };
+  });
+}
+
+function createExplosionBurst(x: number, y: number, accentColor: string): ExplosionParticle[] {
+  return Array.from({ length: 34 }, (_, index) => {
+    const angle = (Math.PI * 2 * index) / 34 + Math.random() * 0.35;
+    const speed = 4 + Math.random() * 10;
+    const colors = [...EXPLOSION_COLORS, accentColor];
+
+    return {
+      x,
+      y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      life: 26 + Math.random() * 18,
+      size: 7 + Math.random() * 11,
+      color: colors[Math.floor(Math.random() * colors.length)],
+    };
+  });
+}
+
 function getFirstOpenSlot(players: PresencePlayer[]) {
   const occupiedSlots = new Set(players.map((player) => player.slotIndex));
   let slotIndex = 0;
@@ -275,31 +412,63 @@ function flattenPresencePlayers(presenceState: Record<string, PresencePlayer[]>)
   return Object.values(presenceState).flat();
 }
 
-async function fetchLeaderboard() {
-  const response = await fetch('/api/leaderboard');
+function getClientTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+}
+
+function normalizeLeaderboardResponse(data: { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] } | null | undefined) {
+  if (data?.leaderboard) {
+    return data.leaderboard;
+  }
+
+  if (data?.entries) {
+    return {
+      allTime: data.entries,
+      today: data.entries,
+    } satisfies LeaderboardData;
+  }
+
+  return getEmptyLeaderboardData();
+}
+
+async function fetchLeaderboard(timeZone: string) {
+  const response = await fetch(`/api/leaderboard?timeZone=${encodeURIComponent(timeZone)}`);
   if (!response.ok) {
     throw new Error('Unable to load leaderboard');
   }
 
-  const data = await response.json() as { entries?: LeaderboardEntry[] };
-  return data.entries ?? [];
+  const data = await response.json() as { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] };
+  return normalizeLeaderboardResponse(data);
 }
 
-async function submitLapTime(initials: string, timeMs: number) {
+async function submitLapTime(initials: string, timeMs: number, timeZone: string) {
   const response = await fetch('/api/leaderboard', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ initials, timeMs }),
+    body: JSON.stringify({ initials, timeMs, timeZone }),
   });
 
   if (!response.ok) {
     throw new Error('Unable to save lap time');
   }
 
-  const data = await response.json() as { entries?: LeaderboardEntry[] };
-  return data.entries ?? [];
+  const data = await response.json() as { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] };
+  return normalizeLeaderboardResponse(data);
+}
+
+async function resetLeaderboard(timeZone: string) {
+  const response = await fetch(`/api/leaderboard?timeZone=${encodeURIComponent(timeZone)}`, {
+    method: 'DELETE',
+  });
+
+  if (!response.ok) {
+    throw new Error('Unable to reset leaderboard');
+  }
+
+  const data = await response.json() as { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] };
+  return normalizeLeaderboardResponse(data);
 }
 
 export default function App() {
@@ -307,11 +476,22 @@ export default function App() {
   const [speedMph, setSpeedMph] = useState(0);
   const [lap, setLap] = useState(1);
   const [lapTime, setLapTime] = useState(0);
+  const [lastLap, setLastLap] = useState<number | null>(null);
   const [bestLap, setBestLap] = useState<number | null>(null);
-  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [leaderboard, setLeaderboard] = useState<LeaderboardData>(() => getEmptyLeaderboardData());
   const [leaderboardStatus, setLeaderboardStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const [playerInitials, setPlayerInitials] = useState('');
   const [initialsInput, setInitialsInput] = useState('');
+  const [isMobileHud, setIsMobileHud] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth < MOBILE_HUD_BREAKPOINT,
+  );
+  const [isHudOpen, setIsHudOpen] = useState(
+    () => !(typeof window !== 'undefined' && window.innerWidth < MOBILE_HUD_BREAKPOINT),
+  );
+  const [lapReadyToFinish, setLapReadyToFinish] = useState(false);
+  const [lapCelebrationMessage, setLapCelebrationMessage] = useState<string | null>(null);
+  const [isResettingLeaderboard, setIsResettingLeaderboard] = useState(false);
+  const clientTimeZone = useRef(getClientTimeZone());
 
   // --- Multiplayer State ---
   const multiplayerRef = useRef<MultiplayerConnection | null>(null);
@@ -319,6 +499,16 @@ export default function App() {
   const myColorRef = useRef<string>('#06b6d4');
   const remotePlayers = useRef<Map<string, RemotePlayer>>(new Map());
   const lastSendTime = useRef<number>(0);
+  const leaderboardRef = useRef<LeaderboardData>(getEmptyLeaderboardData());
+  const confettiParticles = useRef<ConfettiParticle[]>([]);
+  const explosionParticles = useRef<ExplosionParticle[]>([]);
+  const isDestroyedRef = useRef(false);
+  const lapReadyToFinishRef = useRef(false);
+  const fpsCurrentRef = useRef<number | null>(null);
+  const fpsAverageRef = useRef<number | null>(null);
+  const fpsSamplesRef = useRef<{ time: number; fps: number }[]>([]);
+  const lastFrameTimeRef = useRef<number | null>(null);
+  const lastFpsUpdateRef = useRef<number>(0);
 
   const keys = useRef<{ [key: string]: boolean }>({});
   const car = useRef({
@@ -333,6 +523,72 @@ export default function App() {
   });
 
   useEffect(() => {
+    const mediaQuery = window.matchMedia(`(max-width: ${MOBILE_HUD_BREAKPOINT - 1}px)`);
+
+    const syncHudMode = (mobile: boolean) => {
+      setIsMobileHud(mobile);
+      setIsHudOpen(!mobile);
+    };
+
+    syncHudMode(mediaQuery.matches);
+
+    const handleChange = (event: MediaQueryListEvent) => {
+      syncHudMode(event.matches);
+    };
+
+    mediaQuery.addEventListener('change', handleChange);
+
+    return () => {
+      mediaQuery.removeEventListener('change', handleChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!lapCelebrationMessage) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setLapCelebrationMessage(null);
+    }, 1800);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [lapCelebrationMessage]);
+
+  useEffect(() => {
+    leaderboardRef.current = leaderboard;
+  }, [leaderboard]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadInitialLeaderboard = async () => {
+      try {
+        setLeaderboardStatus('loading');
+        const nextLeaderboard = await fetchLeaderboard(clientTimeZone.current);
+        if (!cancelled) {
+          leaderboardRef.current = nextLeaderboard;
+          setLeaderboard(nextLeaderboard);
+          setLeaderboardStatus('ready');
+        }
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          setLeaderboardStatus('error');
+        }
+      }
+    };
+
+    void loadInitialLeaderboard();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!playerInitials) {
       return;
     }
@@ -342,9 +598,10 @@ export default function App() {
     const loadLeaderboard = async () => {
       try {
         setLeaderboardStatus('loading');
-        const entries = await fetchLeaderboard();
+        const nextLeaderboard = await fetchLeaderboard(clientTimeZone.current);
         if (!cancelled) {
-          setLeaderboard(entries);
+          leaderboardRef.current = nextLeaderboard;
+          setLeaderboard(nextLeaderboard);
           setLeaderboardStatus('ready');
         }
       } catch (error) {
@@ -357,11 +614,12 @@ export default function App() {
 
     const saveLapTime = async (timeMs: number) => {
       try {
-        const entries = await submitLapTime(playerInitials, timeMs);
+        const nextLeaderboard = await submitLapTime(playerInitials, timeMs, clientTimeZone.current);
         if (!cancelled) {
-          setLeaderboard(entries);
+          leaderboardRef.current = nextLeaderboard;
+          setLeaderboard(nextLeaderboard);
           setLeaderboardStatus('ready');
-          multiplayerRef.current?.broadcastLeaderboard(entries);
+          multiplayerRef.current?.broadcastLeaderboard();
         }
       } catch (error) {
         console.error(error);
@@ -381,6 +639,18 @@ export default function App() {
     myColorRef.current = '#06b6d4';
     myIdRef.current = 'local';
     remotePlayers.current.clear();
+    confettiParticles.current = [];
+    explosionParticles.current = [];
+    isDestroyedRef.current = false;
+    lapReadyToFinishRef.current = false;
+    fpsCurrentRef.current = null;
+    fpsAverageRef.current = null;
+    fpsSamplesRef.current = [];
+    lastFrameTimeRef.current = null;
+    lastFpsUpdateRef.current = 0;
+    setLastLap(null);
+    setLapReadyToFinish(false);
+    setLapCelebrationMessage(null);
     const shouldUseRealtimeServer = !window.location.hostname.endsWith('.vercel.app');
     multiplayerRef.current = null;
 
@@ -437,8 +707,7 @@ export default function App() {
               p.vy = msg.vy;
             }
           } else if (msg.type === 'leaderboard') {
-            setLeaderboard(msg.entries ?? []);
-            setLeaderboardStatus('ready');
+            void loadLeaderboard();
           } else if (msg.type === 'leave') {
             remotePlayers.current.delete(msg.id);
           }
@@ -503,10 +772,9 @@ export default function App() {
         });
       });
 
-      channel.on<{ entries?: LeaderboardEntry[] }>('broadcast', { event: 'leaderboard' }, ({ payload }) => {
+      channel.on('broadcast', { event: 'leaderboard' }, () => {
         if (!cancelled) {
-          setLeaderboard(payload.entries ?? []);
-          setLeaderboardStatus('ready');
+          void loadLeaderboard();
         }
       });
 
@@ -573,11 +841,10 @@ export default function App() {
             payload: update,
           });
         },
-        broadcastLeaderboard: (entries: LeaderboardEntry[]) => {
+        broadcastLeaderboard: () => {
           void channel.send({
             type: 'broadcast',
             event: 'leaderboard',
-            payload: { entries },
           });
         },
       } satisfies MultiplayerConnection;
@@ -641,12 +908,33 @@ export default function App() {
       const c = car.current;
       const state = gameState.current;
       const prevX = c.x;
+      const isDestroyed = isDestroyedRef.current;
+      const previousFrameTime = lastFrameTimeRef.current;
+
+      if (previousFrameTime !== null) {
+        const frameDelta = time - previousFrameTime;
+        if (frameDelta > 0 && (lastFpsUpdateRef.current === 0 || time - lastFpsUpdateRef.current >= FPS_DISPLAY_UPDATE_MS)) {
+          const currentFps = 1000 / frameDelta;
+          fpsSamplesRef.current.push({ time, fps: currentFps });
+          while (fpsSamplesRef.current.length > 0 && fpsSamplesRef.current[0].time < time - FPS_AVERAGE_WINDOW_MS) {
+            fpsSamplesRef.current.shift();
+          }
+
+          const averageFps = fpsSamplesRef.current.reduce((sum, sample) => sum + sample.fps, 0) / fpsSamplesRef.current.length;
+
+          lastFpsUpdateRef.current = time;
+          fpsCurrentRef.current = currentFps;
+          fpsAverageRef.current = averageFps;
+        }
+      }
+
+      lastFrameTimeRef.current = time;
 
       // --- Physics ---
-      const isAccelerating = keys.current['arrowup'] || keys.current['w'];
-      const isBraking = keys.current['arrowdown'] || keys.current['s'] || keys.current.space;
-      const isTurningLeft = keys.current['arrowleft'] || keys.current['a'];
-      const isTurningRight = keys.current['arrowright'] || keys.current['d'];
+      const isAccelerating = !isDestroyed && (keys.current['arrowup'] || keys.current['w']);
+      const isBraking = !isDestroyed && (keys.current['arrowdown'] || keys.current['s'] || keys.current.space);
+      const isTurningLeft = !isDestroyed && (keys.current['arrowleft'] || keys.current['a']);
+      const isTurningRight = !isDestroyed && (keys.current['arrowright'] || keys.current['d']);
       const steerInput = (isTurningRight ? 1 : 0) - (isTurningLeft ? 1 : 0);
 
       const forwardX = Math.cos(c.angle);
@@ -760,19 +1048,56 @@ export default function App() {
           c.x >= START_FINISH_X &&
           Math.abs(c.y - START_FINISH_Y) < HALF_TRACK_WIDTH
         ) {
+          if (playerInitials === EASTER_EGG_INITIALS) {
+            const currentLapTime = time - state.lapStartTime;
+            explosionParticles.current.push(...createExplosionBurst(c.x, c.y, myColorRef.current));
+            isDestroyedRef.current = true;
+            c.vx = 0;
+            c.vy = 0;
+            state.nextCheckpoint = 0;
+            state.lapStartTime = time;
+            setLapCelebrationMessage(null);
+            setSpeedMph(0);
+            setLapTime(Math.max(0, currentLapTime));
+          } else {
           // Lap complete!
-          const currentLapTime = time - state.lapStartTime;
-          setBestLap(prev => prev === null ? currentLapTime : Math.min(prev, currentLapTime));
-          void saveLapTime(currentLapTime);
-          setLap(l => l + 1);
-          state.nextCheckpoint = 0;
-          state.lapStartTime = time;
+            const currentLapTime = time - state.lapStartTime;
+            const currentLapPlacement = getBestLeaderboardPlacement(currentLapTime, leaderboardRef.current);
+            setLastLap(currentLapTime);
+            setBestLap(prev => prev === null ? currentLapTime : Math.min(prev, currentLapTime));
+            void saveLapTime(currentLapTime);
+            if (currentLapPlacement !== null) {
+              const confettiColors = currentLapPlacement < 3
+                ? PODIUM_CONFETTI_COLORS[currentLapPlacement]
+                : CONFETTI_COLORS;
+              setLapCelebrationMessage('NEW RECORD!!!');
+              confettiParticles.current.push(
+                ...createConfettiBurst('left', canvas.width, canvas.height, confettiColors),
+                ...createConfettiBurst('right', canvas.width, canvas.height, confettiColors),
+              );
+            } else {
+              setLapCelebrationMessage(null);
+            }
+            setLap(l => l + 1);
+            state.nextCheckpoint = 0;
+            state.lapStartTime = time;
+          }
         }
       }
 
+      const nextLapReadyToFinish = state.nextCheckpoint >= checkpoints.length;
+      if (lapReadyToFinishRef.current !== nextLapReadyToFinish) {
+        lapReadyToFinishRef.current = nextLapReadyToFinish;
+        setLapReadyToFinish(nextLapReadyToFinish);
+      }
+
       // Update UI
-      setSpeedMph(Math.abs(Math.round(speed * 3.1)));
-      setLapTime(time - state.lapStartTime);
+      if (isDestroyed) {
+        setSpeedMph(0);
+      } else {
+        setSpeedMph(Math.abs(Math.round(speed * 3.1)));
+        setLapTime(Math.max(0, time - state.lapStartTime));
+      }
 
       // --- Camera ---
       const targetCameraX = canvas.width / 2 - (c.x + c.vx * 15);
@@ -863,9 +1188,67 @@ export default function App() {
       });
 
       // Local Car
-      drawCar(ctx, c.x, c.y, c.angle, myColorRef.current, true);
+      for (let i = explosionParticles.current.length - 1; i >= 0; i--) {
+        const particle = explosionParticles.current[i];
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        particle.vx *= 0.94;
+        particle.vy *= 0.94;
+        particle.life -= 1;
+
+        if (particle.life <= 0) {
+          explosionParticles.current.splice(i, 1);
+          continue;
+        }
+
+        ctx.save();
+        ctx.translate(particle.x, particle.y);
+        ctx.globalAlpha = Math.min(1, particle.life / 16);
+        ctx.fillStyle = particle.color;
+        ctx.shadowColor = particle.color;
+        ctx.shadowBlur = 18;
+        ctx.beginPath();
+        ctx.arc(0, 0, particle.size * (particle.life / 36), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      if (!isDestroyed) {
+        drawCar(ctx, c.x, c.y, c.angle, myColorRef.current, true);
+      }
 
       ctx.restore();
+
+      for (let i = confettiParticles.current.length - 1; i >= 0; i--) {
+        const particle = confettiParticles.current[i];
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        particle.vx *= 0.992;
+        particle.vy += 0.35;
+        particle.rotation += particle.spin;
+        particle.life -= 1;
+
+        if (particle.life <= 0 || particle.y > canvas.height + 120) {
+          confettiParticles.current.splice(i, 1);
+          continue;
+        }
+
+        ctx.save();
+        ctx.translate(particle.x, particle.y);
+        ctx.rotate(particle.rotation);
+        ctx.globalAlpha = Math.min(1, particle.life / 18);
+        ctx.fillStyle = particle.color;
+
+        if (particle.shape === 'circle') {
+          ctx.beginPath();
+          ctx.arc(0, 0, particle.size * 0.45, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillRect(-particle.size / 2, -particle.size * 0.35, particle.size, particle.size * 0.7);
+        }
+
+        ctx.restore();
+      }
 
       animationId = requestAnimationFrame(loop);
     };
@@ -900,39 +1283,141 @@ export default function App() {
     setPlayerInitials(nextInitials);
   };
 
-  return (
-    <div className="relative w-full h-screen overflow-hidden bg-green-900 font-sans">
-      <canvas ref={canvasRef} className="block w-full h-full" />
-      
-      {/* HUD */}
-      <div className="absolute top-6 left-6 bg-black/60 text-white p-5 rounded-2xl backdrop-blur-md border border-white/10 shadow-xl pointer-events-none">
-        <h1 className="text-2xl font-black mb-1 text-transparent bg-clip-text bg-gradient-to-r from-rose-400 to-orange-400 italic tracking-wider">
-          APEX RACER
-        </h1>
-        <p className="text-sm text-gray-300 font-medium mb-4">WASD or Arrows to drive</p>
-        
-        <div className="space-y-2 font-mono">
-          <div className="flex justify-between items-center gap-6">
-            <span className="text-gray-400 uppercase text-xs tracking-widest">Lap</span>
-            <span className="text-xl font-bold">{lap}</span>
-          </div>
-          <div className="flex justify-between items-center gap-6">
-            <span className="text-gray-400 uppercase text-xs tracking-widest">Time</span>
-            <span className="text-xl font-bold text-yellow-400">{formatTime(lapTime)}</span>
-          </div>
-          {bestLap !== null && (
-            <div className="flex justify-between items-center gap-6">
-              <span className="text-gray-400 uppercase text-xs tracking-widest">Best</span>
-              <span className="text-lg font-bold text-green-400">{formatTime(bestLap)}</span>
-            </div>
+  const handleResetLeaderboard = async () => {
+    if (isResettingLeaderboard) {
+      return;
+    }
+
+    const confirmed = window.confirm('Reset today\'s leaderboard records only? All-time scores will stay.');
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      setIsResettingLeaderboard(true);
+      const nextLeaderboard = await resetLeaderboard(clientTimeZone.current);
+      leaderboardRef.current = nextLeaderboard;
+      setLeaderboard(nextLeaderboard);
+      setLeaderboardStatus('ready');
+      setLapCelebrationMessage(null);
+      multiplayerRef.current?.broadcastLeaderboard();
+    } catch (error) {
+      console.error(error);
+      setLeaderboardStatus('error');
+    } finally {
+      setIsResettingLeaderboard(false);
+    }
+  };
+
+  const currentLapDisplay = formatTime(lapTime);
+  const currentLapPlacement = playerInitials && lapReadyToFinish
+    ? getBestLeaderboardPlacement(lapTime, leaderboard, PODIUM_EMOJIS.length)
+    : null;
+  const currentLapMedal = getPlacementMedal(currentLapPlacement);
+  const currentLapMedalLabel = currentLapPlacement === null
+    ? null
+    : ['gold', 'silver', 'bronze'][currentLapPlacement];
+  const leaderboardSlots = Array.from({ length: LEADERBOARD_DISPLAY_COUNT }, (_, index) => index);
+  const isLeaderboardLoading = leaderboardStatus === 'idle' || leaderboardStatus === 'loading';
+  const currentFpsDisplay = fpsCurrentRef.current === null ? '--' : Math.round(fpsCurrentRef.current).toString();
+  const averageFpsDisplay = fpsAverageRef.current === null ? '--' : Math.round(fpsAverageRef.current).toString();
+  const hudToggleButton = (
+    <button
+      aria-expanded={isHudOpen}
+      aria-label={isHudOpen ? 'Collapse race HUD' : 'Expand race HUD'}
+      className="flex h-10 w-10 items-center justify-center rounded-xl border border-white/10 bg-white/5 text-white transition active:scale-[0.98]"
+      onClick={() => setIsHudOpen((open) => !open)}
+      type="button"
+    >
+      {isHudOpen ? (
+        <svg fill="none" height="20" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="20">
+          <path d="M18 6 6 18" />
+          <path d="m6 6 12 12" />
+        </svg>
+      ) : (
+        <svg fill="none" height="20" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="20">
+          <path d="M4 7h16" />
+          <path d="M4 12h16" />
+          <path d="M4 17h16" />
+        </svg>
+      )}
+    </button>
+  );
+  const compactHud = (
+    <div className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/10 bg-black/70 px-3 py-3 text-white shadow-xl backdrop-blur-md">
+      {hudToggleButton}
+
+      <div className="min-w-0">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.35em] text-white/45">
+          Lap {lap}
+        </div>
+        <div className="mt-1 flex items-center gap-2 font-mono">
+          <span className="text-lg font-bold text-yellow-400">{currentLapDisplay}</span>
+          {currentLapMedal && currentLapMedalLabel && (
+            <span
+              aria-label={`Current lap is on ${currentLapMedalLabel} pace`}
+              role="img"
+              title={`Current lap is on ${currentLapMedalLabel} pace`}
+            >
+              {currentLapMedal}
+            </span>
           )}
-          <div className="pt-3 mt-3 border-t border-white/10">
-            <div className="text-gray-400 uppercase text-xs tracking-widest mb-2">Top 3 Fastest</div>
-            <div className="space-y-2">
-              {[0, 1, 2].map((index) => {
-                const entry = leaderboard[index];
+        </div>
+      </div>
+    </div>
+  );
+
+  const hudDetails = (
+    <>
+      <h1 className="mb-1 bg-gradient-to-r from-rose-400 to-orange-400 bg-clip-text text-xl font-black italic tracking-wider text-transparent sm:text-2xl">
+        APEX RACER
+      </h1>
+      <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive</p>
+
+      <div className="space-y-2 font-mono">
+        <div className="flex items-center justify-between gap-4 sm:gap-6">
+          <span className="text-xs uppercase tracking-widest text-gray-400">Lap</span>
+          <span className="text-lg font-bold sm:text-xl">{lap}</span>
+        </div>
+        <div className="flex items-center justify-between gap-4 sm:gap-6">
+          <span className="text-xs uppercase tracking-widest text-gray-400">Time</span>
+          <div className="flex items-center gap-2">
+            <span className="text-lg font-bold text-yellow-400 sm:text-xl">{currentLapDisplay}</span>
+            {currentLapMedal && currentLapMedalLabel && (
+              <span
+                aria-label={`Current lap is on ${currentLapMedalLabel} pace`}
+                role="img"
+                title={`Current lap is on ${currentLapMedalLabel} pace`}
+              >
+                {currentLapMedal}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center justify-between gap-4 sm:gap-6">
+          <span className="text-xs uppercase tracking-widest text-gray-400">Last lap</span>
+          <span className={lastLap === null ? 'text-base font-bold text-white/30 sm:text-lg' : 'text-base font-bold text-cyan-100 sm:text-lg'}>
+            {lastLap === null ? '--:--.--' : formatTime(lastLap)}
+          </span>
+        </div>
+        <div className="flex items-center justify-between gap-4 sm:gap-6">
+          <span className="text-xs uppercase tracking-widest text-gray-400">Best lap</span>
+          <span className={bestLap === null ? 'text-base font-bold text-white/30 sm:text-lg' : 'text-base font-bold text-green-400 sm:text-lg'}>
+            {bestLap === null ? '--:--.--' : formatTime(bestLap)}
+          </span>
+        </div>
+        <div className="mt-3 border-t border-white/10 pt-3">
+          <div className="mb-2 text-xs uppercase tracking-widest text-gray-400">Top 5 All Time</div>
+          <div className="space-y-2">
+            {isLeaderboardLoading ? (
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-center text-[10px] font-semibold uppercase tracking-[0.28em] text-white/45 animate-pulse">
+                Loading top scores...
+              </div>
+            ) : (
+              leaderboardSlots.map((index) => {
+                const entry = leaderboard.allTime[index];
                 return (
-                  <div key={index} className="flex justify-between items-center gap-6 text-sm">
+                  <div key={`all-time-${index}`} className="flex items-center justify-between gap-4 text-sm sm:gap-6">
                     <span className="text-white/80">
                       {`#${index + 1} `}
                       <span className="font-bold">{entry?.initials ?? '---'}</span>
@@ -942,14 +1427,89 @@ export default function App() {
                     </span>
                   </div>
                 );
-              })}
-            </div>
-            {leaderboardStatus === 'error' && (
-              <p className="mt-2 text-xs text-rose-300">Leaderboard unavailable</p>
+              })
             )}
           </div>
         </div>
+        <div className="mt-4 border-t border-white/10 pt-3">
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <span className="text-xs uppercase tracking-widest text-gray-400">Top 5 Today</span>
+            <button
+              className="pointer-events-auto rounded-full border border-rose-400/25 bg-rose-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.25em] text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={isResettingLeaderboard || isLeaderboardLoading}
+              onClick={() => {
+                void handleResetLeaderboard();
+              }}
+              type="button"
+            >
+              {isResettingLeaderboard ? 'Resetting' : 'Reset'}
+            </button>
+          </div>
+          <div className="space-y-2">
+            {isLeaderboardLoading ? (
+              <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-center text-[10px] font-semibold uppercase tracking-[0.28em] text-white/45 animate-pulse">
+                Loading top scores...
+              </div>
+            ) : (
+              leaderboardSlots.map((index) => {
+                const entry = leaderboard.today[index];
+                return (
+                  <div key={`today-${index}`} className="flex items-center justify-between gap-4 text-sm sm:gap-6">
+                    <span className="text-white/80">
+                      {`#${index + 1} `}
+                      <span className="font-bold">{entry?.initials ?? '---'}</span>
+                    </span>
+                    <span className={entry ? 'font-bold text-cyan-100' : 'text-white/30'}>
+                      {entry ? formatTime(entry.timeMs) : '--:--.--'}
+                    </span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+          {leaderboardStatus === 'error' && (
+            <p className="mt-2 text-xs text-rose-300">Leaderboard unavailable</p>
+          )}
+        </div>
       </div>
+    </>
+  );
+
+  return (
+    <div className="relative w-full h-screen overflow-hidden bg-green-900 font-sans">
+      <canvas ref={canvasRef} className="block w-full h-full" />
+      
+      {/* HUD */}
+      <div className="pointer-events-none absolute top-4 left-4 z-20 flex flex-col gap-3 sm:top-6 sm:left-6">
+        {isMobileHud ? (
+          <>
+            {compactHud}
+
+            {isHudOpen && (
+              <div className="pointer-events-auto max-h-[min(70vh,28rem)] w-[min(18rem,calc(100vw-2rem))] overflow-y-auto rounded-3xl border border-white/10 bg-black/70 p-4 text-white shadow-2xl backdrop-blur-md">
+                {hudDetails}
+              </div>
+            )}
+          </>
+        ) : isHudOpen ? (
+          <div className="pointer-events-auto relative w-72 rounded-2xl border border-white/10 bg-black/60 p-5 pr-16 text-white shadow-xl backdrop-blur-md">
+            <div className="absolute right-4 top-4">
+              {hudToggleButton}
+            </div>
+            {hudDetails}
+          </div>
+        ) : (
+          compactHud
+        )}
+      </div>
+
+      {lapCelebrationMessage && (
+        <div className="pointer-events-none absolute top-5 left-1/2 z-30 -translate-x-1/2 px-4 sm:top-6">
+          <div className="animate-pulse rounded-full border border-amber-200/40 bg-gradient-to-r from-amber-500/85 to-orange-500/85 px-5 py-3 text-center text-xs font-black uppercase tracking-[0.32em] text-white shadow-2xl backdrop-blur-md sm:text-sm">
+            {lapCelebrationMessage}
+          </div>
+        </div>
+      )}
 
       <div className="absolute top-6 right-6 bg-black/60 text-white p-6 rounded-3xl backdrop-blur-md border border-white/10 shadow-xl flex flex-col items-end pointer-events-none">
         <div className="text-5xl font-black italic tracking-tighter">
@@ -957,6 +1517,16 @@ export default function App() {
         </div>
         <div className="text-rose-400 font-bold tracking-widest text-sm uppercase mt-1">
           mph
+        </div>
+      </div>
+
+      <div className="pointer-events-none absolute bottom-28 left-8 z-20 rounded-2xl border border-white/10 bg-black/35 px-3 py-2 text-[10px] font-mono uppercase tracking-[0.28em] text-white/55 backdrop-blur-md">
+        <div className="text-white/35">FPS</div>
+        <div className="mt-1 text-sm font-semibold tracking-[0.16em] text-white/75">
+          {currentFpsDisplay}
+          <span className="mx-1 text-white/30">/</span>
+          {averageFpsDisplay}
+          <span className="ml-1 text-[9px] tracking-[0.22em] text-white/35">10s avg</span>
         </div>
       </div>
 
