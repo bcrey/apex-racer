@@ -42,6 +42,9 @@ const HALF_TRACK_WIDTH = TRACK_WIDTH / 2;
 const START_FINISH_LINE_WIDTH = 20;
 const START_FINISH_X = 900;
 const START_FINISH_Y = 0;
+const STARTING_GRID_OFFSET = 140;
+const DEFAULT_START_X = START_FINISH_X - STARTING_GRID_OFFSET;
+const DEFAULT_START_Y = -80;
 
 type RemotePlayer = {
   id: string;
@@ -277,7 +280,7 @@ export default function App() {
 
   const keys = useRef<{ [key: string]: boolean }>({});
   const car = useRef({
-    x: 0, y: 0,
+    x: DEFAULT_START_X, y: DEFAULT_START_Y,
     vx: 0, vy: 0,
     angle: 0,
   });
@@ -327,45 +330,59 @@ export default function App() {
 
     void loadLeaderboard();
 
-    // --- WebSocket Setup ---
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    car.current.x = DEFAULT_START_X;
+    car.current.y = DEFAULT_START_Y;
+    car.current.vx = 0;
+    car.current.vy = 0;
+    car.current.angle = 0;
+    myColorRef.current = '#06b6d4';
+    myIdRef.current = 'local';
+    remotePlayers.current.clear();
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'init') {
-          myIdRef.current = msg.id;
-          myColorRef.current = msg.color;
-          car.current.x = msg.x;
-          car.current.y = msg.y;
-          remotePlayers.current.clear();
-          msg.players.forEach((p: RemotePlayer) => {
-            if (p.id !== msg.id) remotePlayers.current.set(p.id, p);
-          });
-        } else if (msg.type === 'join') {
-          remotePlayers.current.set(msg.player.id, msg.player);
-        } else if (msg.type === 'update') {
-          const p = remotePlayers.current.get(msg.id);
-          if (p) {
-            p.x = msg.x;
-            p.y = msg.y;
-            p.angle = msg.angle;
-            p.vx = msg.vx;
-            p.vy = msg.vy;
+    // --- WebSocket Setup ---
+    const shouldUseRealtimeServer = !window.location.hostname.endsWith('.vercel.app');
+    if (shouldUseRealtimeServer) {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'init') {
+            myIdRef.current = msg.id;
+            myColorRef.current = msg.color;
+            car.current.x = msg.x;
+            car.current.y = msg.y;
+            remotePlayers.current.clear();
+            msg.players.forEach((p: RemotePlayer) => {
+              if (p.id !== msg.id) remotePlayers.current.set(p.id, p);
+            });
+          } else if (msg.type === 'join') {
+            remotePlayers.current.set(msg.player.id, msg.player);
+          } else if (msg.type === 'update') {
+            const p = remotePlayers.current.get(msg.id);
+            if (p) {
+              p.x = msg.x;
+              p.y = msg.y;
+              p.angle = msg.angle;
+              p.vx = msg.vx;
+              p.vy = msg.vy;
+            }
+          } else if (msg.type === 'leaderboard') {
+            setLeaderboard(msg.entries ?? []);
+            setLeaderboardStatus('ready');
+          } else if (msg.type === 'leave') {
+            remotePlayers.current.delete(msg.id);
           }
-        } else if (msg.type === 'leaderboard') {
-          setLeaderboard(msg.entries ?? []);
-          setLeaderboardStatus('ready');
-        } else if (msg.type === 'leave') {
-          remotePlayers.current.delete(msg.id);
+        } catch (e) {
+          console.error(e);
         }
-      } catch (e) {
-        console.error(e);
-      }
-    };
+      };
+    } else {
+      wsRef.current = null;
+    }
 
     const handleKeyDown = (e: KeyboardEvent) => {
       keys.current[e.key.toLowerCase()] = true;
