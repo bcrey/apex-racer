@@ -1,3 +1,11 @@
+import {
+  ensureLeaderboardTable,
+  getTopLapTimes,
+  hasLeaderboardDatabase,
+  recordLapTime,
+  sanitizeInitials,
+} from '../lib/leaderboard.js';
+
 export const runtime = 'nodejs';
 
 function json(body: unknown, init?: ResponseInit) {
@@ -12,14 +20,12 @@ function json(body: unknown, init?: ResponseInit) {
 
 async function loadLeaderboard() {
   try {
-    const leaderboard = await import('../lib/leaderboard');
-
-    if (!leaderboard.hasLeaderboardDatabase()) {
+    if (!hasLeaderboardDatabase()) {
       return json({ error: 'DATABASE_URL is not configured on Vercel.' }, { status: 503 });
     }
 
-    await leaderboard.ensureLeaderboardTable();
-    const entries = await leaderboard.getTopLapTimes();
+    await ensureLeaderboardTable();
+    const entries = await getTopLapTimes();
     return json({ entries });
   } catch (error) {
     console.error('Unable to load leaderboard', error);
@@ -50,16 +56,14 @@ async function saveLeaderboard(request: Request) {
   }
 
   try {
-    const leaderboard = await import('../lib/leaderboard');
-
-    if (!leaderboard.hasLeaderboardDatabase()) {
+    if (!hasLeaderboardDatabase()) {
       return json({ error: 'DATABASE_URL is not configured on Vercel.' }, { status: 503 });
     }
 
-    const initials = leaderboard.sanitizeInitials(body?.initials);
+    const initials = sanitizeInitials(body?.initials);
 
-    await leaderboard.ensureLeaderboardTable();
-    const entries = await leaderboard.recordLapTime(initials, timeMs);
+    await ensureLeaderboardTable();
+    const entries = await recordLapTime(initials, timeMs);
     return json({ entries }, { status: 201 });
   } catch (error) {
     console.error('Unable to save leaderboard entry', error);
