@@ -110,8 +110,6 @@ type ExplosionParticle = {
 
 const MOBILE_HUD_BREAKPOINT = 768;
 const LEADERBOARD_DISPLAY_COUNT = 5;
-const FPS_AVERAGE_WINDOW_MS = 10_000;
-const FPS_DISPLAY_UPDATE_MS = 250;
 const PODIUM_EMOJIS = ['🥇', '🥈', '🥉'] as const;
 const CONFETTI_COLORS = ['#f43f5e', '#f59e0b', '#fde047', '#22c55e', '#38bdf8', '#a78bfa'];
 const PODIUM_CONFETTI_COLORS = [
@@ -504,11 +502,6 @@ export default function App() {
   const explosionParticles = useRef<ExplosionParticle[]>([]);
   const isDestroyedRef = useRef(false);
   const lapReadyToFinishRef = useRef(false);
-  const fpsCurrentRef = useRef<number | null>(null);
-  const fpsAverageRef = useRef<number | null>(null);
-  const fpsSamplesRef = useRef<{ time: number; fps: number }[]>([]);
-  const lastFrameTimeRef = useRef<number | null>(null);
-  const lastFpsUpdateRef = useRef<number>(0);
 
   const keys = useRef<{ [key: string]: boolean }>({});
   const car = useRef({
@@ -643,11 +636,6 @@ export default function App() {
     explosionParticles.current = [];
     isDestroyedRef.current = false;
     lapReadyToFinishRef.current = false;
-    fpsCurrentRef.current = null;
-    fpsAverageRef.current = null;
-    fpsSamplesRef.current = [];
-    lastFrameTimeRef.current = null;
-    lastFpsUpdateRef.current = 0;
     setLastLap(null);
     setLapReadyToFinish(false);
     setLapCelebrationMessage(null);
@@ -909,26 +897,6 @@ export default function App() {
       const state = gameState.current;
       const prevX = c.x;
       const isDestroyed = isDestroyedRef.current;
-      const previousFrameTime = lastFrameTimeRef.current;
-
-      if (previousFrameTime !== null) {
-        const frameDelta = time - previousFrameTime;
-        if (frameDelta > 0 && (lastFpsUpdateRef.current === 0 || time - lastFpsUpdateRef.current >= FPS_DISPLAY_UPDATE_MS)) {
-          const currentFps = 1000 / frameDelta;
-          fpsSamplesRef.current.push({ time, fps: currentFps });
-          while (fpsSamplesRef.current.length > 0 && fpsSamplesRef.current[0].time < time - FPS_AVERAGE_WINDOW_MS) {
-            fpsSamplesRef.current.shift();
-          }
-
-          const averageFps = fpsSamplesRef.current.reduce((sum, sample) => sum + sample.fps, 0) / fpsSamplesRef.current.length;
-
-          lastFpsUpdateRef.current = time;
-          fpsCurrentRef.current = currentFps;
-          fpsAverageRef.current = averageFps;
-        }
-      }
-
-      lastFrameTimeRef.current = time;
 
       // --- Physics ---
       const isAccelerating = !isDestroyed && (keys.current['arrowup'] || keys.current['w']);
@@ -1319,8 +1287,6 @@ export default function App() {
     : ['gold', 'silver', 'bronze'][currentLapPlacement];
   const leaderboardSlots = Array.from({ length: LEADERBOARD_DISPLAY_COUNT }, (_, index) => index);
   const isLeaderboardLoading = leaderboardStatus === 'idle' || leaderboardStatus === 'loading';
-  const currentFpsDisplay = fpsCurrentRef.current === null ? '--' : Math.round(fpsCurrentRef.current).toString();
-  const averageFpsDisplay = fpsAverageRef.current === null ? '--' : Math.round(fpsAverageRef.current).toString();
   const hudToggleButton = (
     <button
       aria-expanded={isHudOpen}
@@ -1517,16 +1483,6 @@ export default function App() {
         </div>
         <div className="text-rose-400 font-bold tracking-widest text-sm uppercase mt-1">
           mph
-        </div>
-      </div>
-
-      <div className="pointer-events-none absolute bottom-28 left-8 z-20 rounded-2xl border border-white/10 bg-black/35 px-3 py-2 text-[10px] font-mono uppercase tracking-[0.28em] text-white/55 backdrop-blur-md">
-        <div className="text-white/35">FPS</div>
-        <div className="mt-1 text-sm font-semibold tracking-[0.16em] text-white/75">
-          {currentFpsDisplay}
-          <span className="mx-1 text-white/30">/</span>
-          {averageFpsDisplay}
-          <span className="ml-1 text-[9px] tracking-[0.22em] text-white/35">10s avg</span>
         </div>
       </div>
 
