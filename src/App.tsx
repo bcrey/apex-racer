@@ -1,4 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
+import {
+  getMissingSupabaseRealtimeEnvVars,
+  getSupabaseClient,
+  hasSupabaseRealtimeConfig,
+} from './lib/supabase';
 
 // --- Math & Physics Helpers ---
 function sqr(x: number) { return x * x; }
@@ -45,6 +50,7 @@ const START_FINISH_Y = 0;
 const STARTING_GRID_OFFSET = 140;
 const DEFAULT_START_X = START_FINISH_X - STARTING_GRID_OFFSET;
 const DEFAULT_START_Y = -80;
+const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899', '#84cc16', '#14b8a6'];
 
 type RemotePlayer = {
   id: string;
@@ -55,6 +61,18 @@ type RemotePlayer = {
   angle: number;
   vx: number;
   vy: number;
+};
+
+type PresencePlayer = RemotePlayer & {
+  slotIndex: number;
+};
+
+type CarUpdate = Pick<RemotePlayer, 'id' | 'x' | 'y' | 'angle' | 'vx' | 'vy'>;
+
+type MultiplayerConnection = {
+  close: () => void;
+  sendUpdate: (update: CarUpdate) => void;
+  broadcastLeaderboard: (entries: LeaderboardEntry[]) => void;
 };
 
 type LeaderboardEntry = {
@@ -233,6 +251,30 @@ function sanitizeInitials(value: string) {
   return value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3);
 }
 
+function getGridPlacement(slotIndex: number) {
+  return {
+    slotIndex,
+    color: PLAYER_COLORS[slotIndex % PLAYER_COLORS.length],
+    x: START_FINISH_X - STARTING_GRID_OFFSET - Math.floor(slotIndex / 2) * 120,
+    y: slotIndex % 2 === 0 ? -80 : 80,
+  };
+}
+
+function getFirstOpenSlot(players: PresencePlayer[]) {
+  const occupiedSlots = new Set(players.map((player) => player.slotIndex));
+  let slotIndex = 0;
+
+  while (occupiedSlots.has(slotIndex)) {
+    slotIndex++;
+  }
+
+  return slotIndex;
+}
+
+function flattenPresencePlayers(presenceState: Record<string, PresencePlayer[]>) {
+  return Object.values(presenceState).flat();
+}
+
 async function fetchLeaderboard() {
   const response = await fetch('/api/leaderboard');
   if (!response.ok) {
@@ -272,7 +314,7 @@ export default function App() {
   const [initialsInput, setInitialsInput] = useState('');
 
   // --- Multiplayer State ---
-  const wsRef = useRef<WebSocket | null>(null);
+  const multiplayerRef = useRef<MultiplayerConnection | null>(null);
   const myIdRef = useRef<string | null>(null);
   const myColorRef = useRef<string>('#06b6d4');
   const remotePlayers = useRef<Map<string, RemotePlayer>>(new Map());
@@ -319,6 +361,7 @@ export default function App() {
         if (!cancelled) {
           setLeaderboard(entries);
           setLeaderboardStatus('ready');
+          multiplayerRef.current?.broadcastLeaderboard(entries);
         }
       } catch (error) {
         console.error(error);
@@ -338,14 +381,37 @@ export default function App() {
     myColorRef.current = '#06b6d4';
     myIdRef.current = 'local';
     remotePlayers.current.clear();
-
-    // --- WebSocket Setup ---
     const shouldUseRealtimeServer = !window.location.hostname.endsWith('.vercel.app');
-    if (shouldUseRealtimeServer) {
+    multiplayerRef.current = null;
+
+    const syncRemotePlayersFromPresence = (players: PresencePlayer[]) => {
+      const nextPlayers = new Map<string, RemotePlayer>();
+
+      players.forEach((player) => {
+        if (player.id === myIdRef.current) {
+          return;
+        }
+
+        const previousPlayer = remotePlayers.current.get(player.id);
+        nextPlayers.set(player.id, {
+          id: player.id,
+          initials: player.initials,
+          color: player.color,
+          x: previousPlayer?.x ?? player.x,
+          y: previousPlayer?.y ?? player.y,
+          angle: previousPlayer?.angle ?? player.angle,
+          vx: previousPlayer?.vx ?? player.vx,
+          vy: previousPlayer?.vy ?? player.vy,
+        });
+      });
+
+      remotePlayers.current = nextPlayers;
+    };
+
+    const setupLocalWebSocketConnection = () => {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}`;
       const ws = new WebSocket(wsUrl);
-      wsRef.current = ws;
 
       ws.onmessage = (event) => {
         try {
@@ -380,9 +446,169 @@ export default function App() {
           console.error(e);
         }
       };
-    } else {
-      wsRef.current = null;
-    }
+
+      return {
+        close: () => {
+          ws.close();
+        },
+        sendUpdate: (update: CarUpdate) => {
+          if (ws.readyState !== WebSocket.OPEN) {
+            return;
+          }
+
+          ws.send(JSON.stringify({ type: 'update', ...update }));
+        },
+        broadcastLeaderboard: () => {},
+      } satisfies MultiplayerConnection;
+    };
+
+    const setupSupabaseRealtime = async () => {
+      const supabase = getSupabaseClient();
+      if (!supabase) {
+        return null;
+      }
+
+      const playerId = crypto.randomUUID();
+      const channel = supabase.channel('apex-racer-room', {
+        config: {
+          broadcast: { self: false },
+          presence: { key: playerId },
+        },
+      });
+
+      channel.on<CarUpdate>('broadcast', { event: 'car-update' }, ({ payload }) => {
+        if (payload.id === playerId) {
+          return;
+        }
+
+        const existingPlayer = remotePlayers.current.get(payload.id);
+        if (existingPlayer) {
+          existingPlayer.x = payload.x;
+          existingPlayer.y = payload.y;
+          existingPlayer.angle = payload.angle;
+          existingPlayer.vx = payload.vx;
+          existingPlayer.vy = payload.vy;
+          return;
+        }
+
+        remotePlayers.current.set(payload.id, {
+          id: payload.id,
+          initials: '???',
+          color: '#94a3b8',
+          x: payload.x,
+          y: payload.y,
+          angle: payload.angle,
+          vx: payload.vx,
+          vy: payload.vy,
+        });
+      });
+
+      channel.on<{ entries?: LeaderboardEntry[] }>('broadcast', { event: 'leaderboard' }, ({ payload }) => {
+        if (!cancelled) {
+          setLeaderboard(payload.entries ?? []);
+          setLeaderboardStatus('ready');
+        }
+      });
+
+      const resyncPresence = () => {
+        const players = flattenPresencePlayers(channel.presenceState<PresencePlayer>());
+        syncRemotePlayersFromPresence(players);
+      };
+
+      channel
+        .on('presence', { event: 'sync' }, resyncPresence)
+        .on('presence', { event: 'join' }, resyncPresence)
+        .on('presence', { event: 'leave' }, resyncPresence);
+
+      await new Promise<void>((resolve, reject) => {
+        channel.subscribe(async (status, error) => {
+          if (status === 'SUBSCRIBED') {
+            try {
+              const existingPlayers = flattenPresencePlayers(channel.presenceState<PresencePlayer>());
+              const slotIndex = getFirstOpenSlot(existingPlayers);
+              const placement = getGridPlacement(slotIndex);
+
+              myIdRef.current = playerId;
+              myColorRef.current = placement.color;
+              car.current.x = placement.x;
+              car.current.y = placement.y;
+              car.current.vx = 0;
+              car.current.vy = 0;
+              car.current.angle = 0;
+
+              await channel.track({
+                id: playerId,
+                initials: playerInitials,
+                color: placement.color,
+                slotIndex,
+                x: placement.x,
+                y: placement.y,
+                angle: 0,
+                vx: 0,
+                vy: 0,
+              } satisfies PresencePlayer);
+
+              resolve();
+            } catch (trackError) {
+              reject(trackError);
+            }
+            return;
+          }
+
+          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+            reject(error ?? new Error(`Supabase Realtime subscription failed with status ${status}`));
+          }
+        });
+      });
+
+      return {
+        close: () => {
+          void channel.untrack();
+          void supabase.removeChannel(channel);
+        },
+        sendUpdate: (update: CarUpdate) => {
+          void channel.send({
+            type: 'broadcast',
+            event: 'car-update',
+            payload: update,
+          });
+        },
+        broadcastLeaderboard: (entries: LeaderboardEntry[]) => {
+          void channel.send({
+            type: 'broadcast',
+            event: 'leaderboard',
+            payload: { entries },
+          });
+        },
+      } satisfies MultiplayerConnection;
+    };
+
+    const initializeMultiplayer = async () => {
+      if (hasSupabaseRealtimeConfig()) {
+        try {
+          const connection = await setupSupabaseRealtime();
+          if (cancelled) {
+            connection?.close();
+            return;
+          }
+
+          multiplayerRef.current = connection;
+          return;
+        } catch (error) {
+          console.error('Unable to connect to Supabase Realtime', error);
+        }
+      } else if (window.location.hostname.endsWith('.vercel.app')) {
+        console.warn(
+          `Supabase Realtime is not configured. Missing env vars: ${getMissingSupabaseRealtimeEnvVars().join(', ')}`,
+        );
+      }
+
+      if (shouldUseRealtimeServer) {
+        multiplayerRef.current = setupLocalWebSocketConnection();
+      }
+    };
+
+    void initializeMultiplayer();
 
     const handleKeyDown = (e: KeyboardEvent) => {
       keys.current[e.key.toLowerCase()] = true;
@@ -504,11 +730,15 @@ export default function App() {
       }
 
       // --- Multiplayer Send ---
-      if (wsRef.current?.readyState === WebSocket.OPEN && time - lastSendTime.current > 50) {
-        wsRef.current.send(JSON.stringify({
-          type: 'update',
-          x: c.x, y: c.y, angle: c.angle, vx: c.vx, vy: c.vy
-        }));
+      if (multiplayerRef.current && time - lastSendTime.current > 50) {
+        multiplayerRef.current.sendUpdate({
+          id: myIdRef.current ?? 'local',
+          x: c.x,
+          y: c.y,
+          angle: c.angle,
+          vx: c.vx,
+          vy: c.vy,
+        });
         lastSendTime.current = time;
       }
 
@@ -643,7 +873,8 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      if (wsRef.current) wsRef.current.close();
+      multiplayerRef.current?.close();
+      multiplayerRef.current = null;
       cancelAnimationFrame(animationId);
       window.removeEventListener('resize', resize);
       window.removeEventListener('keydown', handleKeyDown);
