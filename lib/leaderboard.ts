@@ -96,6 +96,13 @@ export async function ensureLeaderboardTable() {
       `;
 
       await sql`
+        create table if not exists leaderboard_daily_resets (
+          time_zone text primary key,
+          reset_at timestamptz not null default now()
+        )
+      `;
+
+      await sql`
         create index if not exists leaderboard_laps_time_ms_idx
         on leaderboard_laps (time_ms asc, created_at asc)
       `;
@@ -137,6 +144,14 @@ export async function getLeaderboardData(timeZone: string) {
       select initials, time_ms as "timeMs"
       from leaderboard_laps
       where (created_at at time zone ${safeTimeZone})::date = (now() at time zone ${safeTimeZone})::date
+        and created_at > coalesce(
+          (
+            select reset_at
+            from leaderboard_daily_resets
+            where time_zone = ${safeTimeZone}
+          ),
+          '-infinity'::timestamptz
+        )
       order by time_ms asc, created_at asc
       limit ${LEADERBOARD_LIMIT}
     `,
@@ -174,8 +189,10 @@ export async function resetLeaderboardData(timeZone: string) {
   const safeTimeZone = sanitizeTimeZone(timeZone);
 
   await sql`
-    delete from leaderboard_laps
-    where (created_at at time zone ${safeTimeZone})::date = (now() at time zone ${safeTimeZone})::date
+    insert into leaderboard_daily_resets (time_zone, reset_at)
+    values (${safeTimeZone}, now())
+    on conflict (time_zone)
+    do update set reset_at = excluded.reset_at
   `;
 
   return getLeaderboardData(timeZone);
