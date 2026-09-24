@@ -1,0 +1,204 @@
+<!doctype html>
+<!-- Source for public/og-image.png. Regenerate with scripts/brand/render.sh -->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<style>
+  html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; background: #166534; }
+  canvas { position: absolute; inset: 0; }
+  .panel {
+    position: absolute; left: 44px; top: 48px; bottom: 48px; width: 456px;
+    box-sizing: border-box; padding: 44px 40px;
+    display: flex; flex-direction: column; justify-content: space-between;
+    background: rgba(0, 0, 0, 0.72); border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 36px; box-shadow: 0 30px 60px rgba(0, 0, 0, 0.35);
+    color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", system-ui, sans-serif;
+  }
+  .kicker { font-size: 17px; font-weight: 700; letter-spacing: 0.35em; text-transform: uppercase; color: #fda4af; }
+  h1 {
+    margin: 14px 0 0; font-size: 104px; line-height: 0.92; font-weight: 900; font-style: italic; letter-spacing: -0.02em;
+    background: linear-gradient(90deg, #fb7185, #fb923c); -webkit-background-clip: text; background-clip: text; color: transparent;
+    padding-right: 12px;
+  }
+  .tagline { margin: 22px 0 0; font-size: 24px; line-height: 1.3; font-weight: 500; color: #e2e8f0; }
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; }
+  .chip {
+    padding: 8px 14px; border-radius: 999px; border: 1px solid rgba(255, 255, 255, 0.14); background: rgba(255, 255, 255, 0.06);
+    font-size: 13px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: #cffafe;
+  }
+  .url { margin-top: 20px; font: 600 20px ui-monospace, "SF Mono", Menlo, monospace; color: #94a3b8; }
+</style>
+</head>
+<body>
+<canvas id="c" width="1200" height="630"></canvas>
+<div class="panel">
+  <div>
+    <div class="kicker">Top-down drift racing</div>
+    <h1>APEX<br />RACER</h1>
+    <p class="tagline">Slide through the circuit, set a lap, and race friends live.</p>
+  </div>
+  <div>
+    <div class="chips">
+      <span class="chip">Multiplayer</span>
+      <span class="chip">Daily leaderboard</span>
+    </div>
+    <div class="url">apex-racer.vercel.app</div>
+  </div>
+</div>
+<script>
+// Track and car art mirror src/App.tsx (trackPoints, TRACK_WIDTH, drawCar).
+const trackPoints = [
+  {x: 0, y: 0}, {x: 1500, y: 0}, {x: 2000, y: 500}, {x: 2000, y: 1500}, {x: 1000, y: 1500},
+  {x: 500, y: 2000}, {x: 500, y: 2500}, {x: 1500, y: 2500}, {x: 2000, y: 3000}, {x: 2000, y: 4000},
+  {x: 0, y: 4000}, {x: -1000, y: 3000}, {x: -1000, y: 1000}, {x: -500, y: 500}, {x: 0, y: 0},
+];
+const TRACK_WIDTH = 400;
+const START_FINISH_X = 900;
+
+// The circuit is portrait; turn it a quarter so it lies across the card.
+const SCALE = 0.145;
+const OX = 566, OY = 533;
+const toCard = p => ({ x: OX + p.y * SCALE, y: OY - (p.x + 1000) * SCALE });
+const pts = trackPoints.map(toCard);
+
+const ctx = document.getElementById('c').getContext('2d');
+
+// Grass
+ctx.fillStyle = '#166534';
+ctx.fillRect(0, 0, 1200, 630);
+ctx.fillStyle = '#14532d';
+for (let x = 0; x < 1300; x += 60) {
+  for (let y = 0; y < 700; y += 60) {
+    ctx.beginPath();
+    ctx.arc(x + Math.sin(x * 12.345 + y * 67.89) * 18, y + Math.cos(x * 98.76 + y * 54.321) * 18, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function tracePath() {
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (const p of pts.slice(1)) ctx.lineTo(p.x, p.y);
+}
+ctx.lineJoin = 'round';
+ctx.lineCap = 'round';
+
+// Kerb edge, asphalt, dashed centre line
+tracePath();
+ctx.lineWidth = TRACK_WIDTH * SCALE + 8;
+ctx.strokeStyle = 'rgba(0, 0, 0, 0.25)';
+ctx.stroke();
+tracePath();
+ctx.lineWidth = TRACK_WIDTH * SCALE;
+ctx.strokeStyle = '#333';
+ctx.stroke();
+tracePath();
+ctx.lineWidth = 2;
+ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+ctx.setLineDash([8, 8]);
+ctx.stroke();
+ctx.setLineDash([]);
+
+// Start/finish checker
+{
+  const sf = toCard({ x: START_FINISH_X, y: 0 });
+  const half = (TRACK_WIDTH * SCALE) / 2;
+  ctx.save();
+  ctx.translate(sf.x, sf.y);
+  ctx.rotate(-Math.PI / 2);
+  for (let i = -half, row = 0; i < half; i += 5, row++) {
+    ctx.fillStyle = row % 2 ? '#000' : '#fff';
+    ctx.fillRect(-5, i, 5, 5);
+    ctx.fillStyle = row % 2 ? '#fff' : '#000';
+    ctx.fillRect(0, i, 5, 5);
+  }
+  ctx.restore();
+}
+
+// Point `t` of the way along segment `i`, with its heading
+function along(i, t, lateral = 0) {
+  const a = pts[i], b = pts[i + 1];
+  const angle = Math.atan2(b.y - a.y, b.x - a.x);
+  return {
+    x: a.x + (b.x - a.x) * t - Math.sin(angle) * lateral,
+    y: a.y + (b.y - a.y) * t + Math.cos(angle) * lateral,
+    angle,
+  };
+}
+
+function drawCar(x, y, angle, color, isLocal) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(angle);
+  ctx.scale(0.85, 0.85);
+  if (isLocal) {
+    const beam = ctx.createLinearGradient(22, 0, 150, 0);
+    beam.addColorStop(0, 'rgba(207, 250, 254, 0.4)');
+    beam.addColorStop(1, 'rgba(207, 250, 254, 0)');
+    ctx.fillStyle = beam;
+    ctx.beginPath();
+    ctx.moveTo(22, -7); ctx.lineTo(150, -35); ctx.lineTo(150, -5); ctx.lineTo(22, -4);
+    ctx.moveTo(22, 7); ctx.lineTo(150, 35); ctx.lineTo(150, 5); ctx.lineTo(22, 4);
+    ctx.fill();
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.beginPath(); ctx.roundRect(-24, -14, 48, 28, 6); ctx.fill();
+  ctx.fillStyle = '#020617';
+  ctx.beginPath();
+  ctx.roundRect(10, -13, 12, 4, 1); ctx.roundRect(10, 9, 12, 4, 1);
+  ctx.roundRect(-16, -13, 12, 4, 1); ctx.roundRect(-16, 9, 12, 4, 1);
+  ctx.fill();
+  ctx.fillStyle = '#1e293b';
+  ctx.beginPath(); ctx.roundRect(-22, -11, 44, 22, 5); ctx.fill();
+  ctx.fillStyle = '#0f172a';
+  ctx.beginPath(); ctx.roundRect(-20, -9, 42, 18, 4); ctx.fill();
+  ctx.fillStyle = color;
+  ctx.fillRect(-18, -3, 38, 2);
+  ctx.fillRect(-18, 1, 38, 2);
+  ctx.fillStyle = '#020617';
+  ctx.beginPath(); ctx.roundRect(-8, -7, 18, 14, 4); ctx.fill();
+  ctx.fillStyle = '#38bdf8';
+  ctx.globalAlpha = 0.7;
+  ctx.beginPath(); ctx.moveTo(4, -6); ctx.lineTo(11, -5); ctx.lineTo(11, 5); ctx.lineTo(4, 6); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-5, -5); ctx.lineTo(-9, -4); ctx.lineTo(-9, 4); ctx.lineTo(-5, 5); ctx.fill();
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#020617';
+  ctx.beginPath(); ctx.roundRect(-24, -10, 5, 20, 2); ctx.fill();
+  ctx.fillStyle = '#cffafe';
+  ctx.beginPath(); ctx.moveTo(19, -9); ctx.lineTo(22, -7); ctx.lineTo(22, -4); ctx.lineTo(19, -4); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(19, 9); ctx.lineTo(22, 7); ctx.lineTo(22, 4); ctx.lineTo(19, 4); ctx.fill();
+  ctx.fillStyle = '#ef4444';
+  ctx.shadowColor = '#ef4444';
+  ctx.shadowBlur = 8;
+  ctx.fillRect(-22, -9, 2, 5);
+  ctx.fillRect(-22, 4, 2, 5);
+  ctx.restore();
+}
+
+// Skid marks behind the lead car as it drifts out of the hairpin
+ctx.strokeStyle = 'rgba(0, 0, 0, 0.35)';
+ctx.lineWidth = 3;
+for (const side of [-6, 6]) {
+  ctx.beginPath();
+  for (let t = 0; t <= 1; t += 0.05) {
+    const p = along(7, 0.2 + t * 0.55, side + Math.sin(t * Math.PI) * 10);
+    t === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y);
+  }
+  ctx.stroke();
+}
+
+// A small pack spread around the lap, in the game's player colours
+const pack = [
+  { seg: 7, t: 0.85, lat: 4, drift: 0.2, color: '#06b6d4', local: true },
+  { seg: 6, t: 0.6, lat: -10, drift: 0.1, color: '#ef4444' },
+  { seg: 9, t: 0.55, lat: 8, drift: 0, color: '#eab308' },
+  { seg: 11, t: 0.35, lat: -8, drift: 0.2, color: '#a855f7' },
+  { seg: 2, t: 0.5, lat: 6, drift: 0, color: '#22c55e' },
+];
+for (const car of pack) {
+  const p = along(car.seg, car.t, car.lat);
+  drawCar(p.x, p.y, p.angle - car.drift, car.color, car.local);
+}
+</script>
+</body>
+</html>
