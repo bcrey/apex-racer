@@ -682,19 +682,6 @@ export function drawLightLayerV2(light: CanvasRenderingContext2D, sources: Light
   }
 }
 
-/** Soft ring under the local car so you can find yourself in a pack. */
-export function drawLocalMarker(ctx: CanvasRenderingContext2D, x: number, y: number, color: string) {
-  ctx.save();
-  ctx.strokeStyle = color;
-  ctx.globalAlpha = 0.35;
-  ctx.lineWidth = 3;
-  ctx.setLineDash([10, 8]);
-  ctx.beginPath();
-  ctx.arc(x, y, 36, 0, Math.PI * 2);
-  ctx.stroke();
-  ctx.restore();
-}
-
 const MINIMAP_BOUNDS = (() => {
   const xs = trackPoints.map((p) => p.x);
   const ys = trackPoints.map((p) => p.y);

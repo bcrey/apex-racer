@@ -28,7 +28,6 @@ import {
   drawCarV2,
   drawGrassV2,
   drawLightLayerV2,
-  drawLocalMarker,
   drawMinimap,
   drawSkidMarksV2,
   drawTrackV2,
@@ -1112,7 +1111,6 @@ export default function App() {
       drawExplosion();
 
       if (!isDestroyed) {
-        drawLocalMarker(ctx, c.x, c.y, myColorRef.current);
         drawCarV2(ctx, c.x, c.y, c.angle, myColorRef.current, { steer: steerInput, braking: isBraking, lights: localLights });
       }
 
