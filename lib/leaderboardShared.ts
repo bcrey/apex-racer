@@ -13,6 +13,11 @@ export type LeaderboardData = {
 
 export const LEADERBOARD_LIMIT = 5;
 
+// No lap can be faster than this. An autopilot flat out on the fixed 60 Hz
+// physics manages about 11.8 s, so 9 s leaves room for the best human line
+// while rejecting impossible times.
+export const MIN_LAP_MS = 9000;
+
 export function emptyLeaderboardData(): LeaderboardData {
   return { allTime: [], today: [] };
 }

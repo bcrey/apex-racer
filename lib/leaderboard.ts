@@ -1,7 +1,9 @@
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import postgres from 'postgres';
 import {
   emptyLeaderboardData,
   LEADERBOARD_LIMIT,
+  MIN_LAP_MS,
   normalizeInitials,
   type LeaderboardData,
   type LeaderboardEntry,
@@ -107,6 +109,16 @@ export async function ensureLeaderboardTable() {
         create index if not exists leaderboard_laps_time_ms_idx
         on leaderboard_laps (time_ms asc, created_at asc)
       `;
+
+      // Each lap-start token can be spent on one lap only
+      await sql`
+        alter table leaderboard_laps add column if not exists lap_token text
+      `;
+
+      await sql`
+        create unique index if not exists leaderboard_laps_lap_token_idx
+        on leaderboard_laps (lap_token)
+      `;
     })();
   }
 
@@ -118,18 +130,123 @@ export async function ensureLeaderboardTable() {
   }
 }
 
-/** Validates a POST body from either server; the error is the 400 message. */
-export function parseLapSubmission(body: { initials?: unknown; timeMs?: unknown; timeZone?: unknown } | null | undefined) {
+// A lap may arrive this much sooner after its start token than the time it
+// claims. Covers a slow lap-start request (a cold serverless start, a phone
+// radio waking up) against a quick submission.
+export const LAP_TOKEN_TOLERANCE_MS = 3000;
+// No lap takes this long; older tokens are refused.
+const LAP_TOKEN_MAX_AGE_MS = 30 * 60 * 1000;
+
+let fallbackLapSecret: Buffer | null = null;
+
+function lapTokenSecret() {
+  const configured = process.env.LEADERBOARD_SECRET?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  // Serverless instances need a secret they all share. The database URL is
+  // already secret and the same on every instance, so derive one from it.
+  if (process.env.DATABASE_URL) {
+    return createHash('sha256').update(`apex-racer-lap-token:${process.env.DATABASE_URL}`).digest();
+  }
+
+  // No database means no leaderboard to protect; any per-process secret will do
+  fallbackLapSecret ??= randomBytes(32);
+  return fallbackLapSecret;
+}
+
+function signLapToken(payload: string) {
+  return createHmac('sha256', lapTokenSecret()).update(payload).digest('base64url');
+}
+
+/** A signed record of when a lap started, by the server's clock. */
+export function issueLapToken(now = Date.now()) {
+  const payload = `${now}.${randomBytes(6).toString('base64url')}`;
+  return `${payload}.${signLapToken(payload)}`;
+}
+
+/** When a lap token was issued, or null if it is malformed or not signed by us. */
+export function readLapToken(token: unknown) {
+  if (typeof token !== 'string') {
+    return null;
+  }
+
+  const parts = token.split('.');
+  if (parts.length !== 3) {
+    return null;
+  }
+
+  const expected = Buffer.from(signLapToken(`${parts[0]}.${parts[1]}`));
+  const actual = Buffer.from(parts[2]);
+  if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) {
+    return null;
+  }
+
+  const issuedAt = Number(parts[0]);
+  return Number.isSafeInteger(issuedAt) ? issuedAt : null;
+}
+
+/**
+ * Validates a POST body from either server; the error is the 400 message.
+ * Besides the time itself, the lap must carry the token the server issued
+ * when it started, and must arrive no sooner than the claimed time after it.
+ * Each token counts once (recordLapTime enforces that), so faking a lap means
+ * really waiting out the claimed time, and it can never beat MIN_LAP_MS.
+ */
+export function parseLapSubmission(
+  body: { initials?: unknown; timeMs?: unknown; timeZone?: unknown; lapToken?: unknown } | null | undefined,
+  now = Date.now(),
+) {
   const timeMs = Math.round(Number(body?.timeMs));
   if (!Number.isFinite(timeMs) || timeMs <= 0) {
     return { error: 'A valid lap time is required' } as const;
+  }
+
+  if (timeMs < MIN_LAP_MS) {
+    return { error: 'Lap time is faster than the track allows' } as const;
+  }
+
+  const startedAt = readLapToken(body?.lapToken);
+  if (startedAt === null) {
+    return { error: 'A valid lap token is required' } as const;
+  }
+
+  const elapsedMs = now - startedAt;
+  if (elapsedMs > LAP_TOKEN_MAX_AGE_MS) {
+    return { error: 'Lap token has expired' } as const;
+  }
+
+  if (elapsedMs < timeMs - LAP_TOKEN_TOLERANCE_MS) {
+    return { error: 'Lap submitted before that much time had passed' } as const;
   }
 
   return {
     initials: sanitizeInitials(typeof body?.initials === 'string' ? body.initials : undefined),
     timeMs,
     timeZone: typeof body?.timeZone === 'string' ? body.timeZone : undefined,
+    lapToken: body?.lapToken as string,
   };
+}
+
+/** True when the Authorization header carries LEADERBOARD_ADMIN_TOKEN. Always false if that is unset. */
+export function isLeaderboardAdmin(authorization: string | null | undefined) {
+  const expected = process.env.LEADERBOARD_ADMIN_TOKEN?.trim();
+  const provided = authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  if (!expected || !provided) {
+    return false;
+  }
+
+  // Compare digests so the check takes the same time whatever the length
+  const digest = (value: string) => createHash('sha256').update(value).digest();
+  return timingSafeEqual(digest(provided), digest(expected));
+}
+
+/** Why a reset was refused: 403 when resets are switched off, 401 for a wrong token. */
+export function leaderboardAdminRefusal() {
+  return process.env.LEADERBOARD_ADMIN_TOKEN?.trim()
+    ? { status: 401, error: 'Admin token required' }
+    : { status: 403, error: 'Leaderboard reset is disabled. Set LEADERBOARD_ADMIN_TOKEN to enable it.' };
 }
 
 export async function getLeaderboardData(timeZone: string | null | undefined) {
@@ -171,7 +288,23 @@ export async function getLeaderboardData(timeZone: string | null | undefined) {
   } satisfies LeaderboardData;
 }
 
-export async function recordLapTime(initials: string, timeMs: number, timeZone: string | null | undefined) {
+/** Thrown by recordLapTime when a lap token has already been spent. */
+export class DuplicateLapError extends Error {
+  constructor() {
+    super('This lap has already been submitted');
+  }
+}
+
+function isUniqueViolation(error: unknown) {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === '23505';
+}
+
+export async function recordLapTime(
+  initials: string,
+  timeMs: number,
+  timeZone: string | null | undefined,
+  lapToken: string,
+) {
   const sql = getSqlClient();
   if (!sql) {
     throw new Error('Leaderboard database is not configured');
@@ -179,10 +312,14 @@ export async function recordLapTime(initials: string, timeMs: number, timeZone: 
 
   await ensureLeaderboardTable();
 
-  await sql`
-    insert into leaderboard_laps (initials, time_ms)
-    values (${initials}, ${timeMs})
-  `;
+  try {
+    await sql`
+      insert into leaderboard_laps (initials, time_ms, lap_token)
+      values (${initials}, ${timeMs}, ${lapToken})
+    `;
+  } catch (error) {
+    throw isUniqueViolation(error) ? new DuplicateLapError() : error;
+  }
 
   return getLeaderboardData(timeZone);
 }

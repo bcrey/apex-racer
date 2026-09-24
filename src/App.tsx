@@ -49,44 +49,51 @@ import {
   type SkidMark,
   type SmokeParticle,
 } from './graphicsV2';
-
-// --- Math & Physics Helpers ---
-function sqr(x: number) { return x * x; }
-function dist2(v: {x: number, y: number}, w: {x: number, y: number}) { return sqr(v.x - w.x) + sqr(v.y - w.y); }
-function distToSegmentSquared(p: {x: number, y: number}, v: {x: number, y: number}, w: {x: number, y: number}) {
-  const l2 = dist2(v, w);
-  if (l2 === 0) return dist2(p, v);
-  let t = ((p.x - v.x) * (w.x - v.x) + (p.y - v.y) * (w.y - v.y)) / l2;
-  t = Math.max(0, Math.min(1, t));
-  return dist2(p, { x: v.x + t * (w.x - v.x), y: v.y + t * (w.y - v.y) });
-}
-
-// Anti-cheat checkpoints
-const checkpoints = [
-  {x: 2000, y: 1500},
-  {x: 1500, y: 2500},
-  {x: -1000, y: 1000}
-];
+import {
+  advanceClock,
+  createFixedClock,
+  easeForFrame,
+  lerp,
+  NO_INPUT,
+  PHYSICS_HZ,
+  stepCar,
+  type CarState,
+  type DriveInput,
+  type StepInfo,
+} from './physics';
+import { CHECKPOINTS, createLapState, updateLap, type LapEvent } from './lap';
+import {
+  formatGap,
+  loadBestLap,
+  recordSample,
+  sampleGhost,
+  saveBestLap,
+  startRecording,
+  ticksToMs,
+  type GhostLap,
+  type GhostRecording,
+} from './ghost';
+import {
+  applyNetworkState,
+  createRemoteCar,
+  remoteDrawState,
+  stepRemoteCar,
+  type NetworkCarState,
+  type RemoteCar,
+} from './remote';
+import { RaceSound } from './sound';
 
 const DEFAULT_START = getGridSlotPosition(0);
 
-type RemotePlayer = {
+type PresencePlayer = NetworkCarState & {
   id: string;
   initials: string;
   color: string;
-  x: number;
-  y: number;
-  angle: number;
-  vx: number;
-  vy: number;
+  slotIndex: number;
   lights?: boolean;
 };
 
-type PresencePlayer = RemotePlayer & {
-  slotIndex: number;
-};
-
-type CarUpdate = Pick<RemotePlayer, 'id' | 'x' | 'y' | 'angle' | 'vx' | 'vy' | 'lights'>;
+type CarUpdate = NetworkCarState & { id: string; lights?: boolean };
 
 type MultiplayerConnection = {
   close: () => void;
@@ -117,7 +124,12 @@ type ExplosionParticle = {
   color: string;
 };
 
-const MOBILE_HUD_BREAKPOINT = 768;
+/** A short message under the top of the screen: a split gap or a lap that did not count. */
+type LapFlash = { id: number; text: string; tone: 'ahead' | 'behind' | 'warn' };
+
+// Touch screens and short or narrow windows start with the small HUD, so the
+// full panel never covers the on-screen driving controls
+const COMPACT_HUD_QUERY = '(max-width: 767px), (max-height: 499px), (pointer: coarse)';
 const PODIUM = [
   { emoji: '🥇', label: 'gold' },
   { emoji: '🥈', label: 'silver' },
@@ -132,7 +144,30 @@ const PODIUM_CONFETTI_COLORS = [
 const EXPLOSION_COLORS = ['#ffffff', '#fde047', '#fb7185', '#f97316', '#ef4444'] as const;
 const EASTER_EGG_INITIALS = 'SLY';
 const GRAPHICS_MODE_STORAGE_KEY = 'apex-racer:graphics';
+const ADMIN_TOKEN_STORAGE_KEY = 'apex-racer:admin-token';
 const HUD_UPDATE_INTERVAL_MS = 33;
+const LAP_FLASH_MS = 2500;
+const GHOST_COLOR = '#e2e8f0';
+const GHOST_ALPHA = 0.35;
+/** Steps of "3, 2, 1" before the car is released, then how long "GO!" stays up. */
+const COUNTDOWN_STEPS = 3 * PHYSICS_HZ;
+const GO_DISPLAY_STEPS = Math.round(0.8 * PHYSICS_HZ);
+
+// Driving keys by physical position (KeyW is the key where W sits on QWERTY),
+// so WASD works on AZERTY and other layouts. Touch buttons use the Touch* names.
+const DRIVING_KEYS = new Set([
+  'KeyW', 'ArrowUp', 'KeyS', 'ArrowDown', 'Space', 'KeyA', 'ArrowLeft', 'KeyD', 'ArrowRight',
+]);
+
+function readDriveInput(held: Record<string, boolean>): DriveInput {
+  const left = held.KeyA || held.ArrowLeft || held.TouchLeft;
+  const right = held.KeyD || held.ArrowRight || held.TouchRight;
+  return {
+    gas: Boolean(held.KeyW || held.ArrowUp || held.TouchGas),
+    brake: Boolean(held.KeyS || held.ArrowDown || held.Space || held.TouchBrake),
+    steer: (right ? 1 : 0) - (left ? 1 : 0),
+  };
+}
 
 function loadGraphicsMode(): GraphicsMode {
   try {
@@ -142,13 +177,40 @@ function loadGraphicsMode(): GraphicsMode {
   }
 }
 
-function getDistanceToTrack(p: {x: number, y: number}) {
-  let minDistSq = Infinity;
-  for (let i = 0; i < trackPoints.length - 1; i++) {
-    const d2 = distToSegmentSquared(p, trackPoints[i], trackPoints[i+1]);
-    if (d2 < minDistSq) minDistSq = d2;
+/**
+ * The leaderboard admin token, if this browser has one. Opening the game with
+ * ?admin=TOKEN saves it (and ?admin= clears it); the query is then removed
+ * from the address bar so it is not shared by accident.
+ */
+function loadAdminToken() {
+  try {
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('admin')) {
+      const token = url.searchParams.get('admin')?.trim() ?? '';
+      if (token) {
+        window.localStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+      } else {
+        window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+      }
+      url.searchParams.delete('admin');
+      window.history.replaceState(window.history.state, '', url.toString());
+    }
+    return window.localStorage.getItem(ADMIN_TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
   }
-  return Math.sqrt(minDistSq);
+}
+
+function forgetAdminToken() {
+  try {
+    window.localStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  } catch {
+    // Nothing stored, or storage blocked
+  }
+}
+
+function isTypingTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
 }
 
 function drawCar(ctx: CanvasRenderingContext2D, x: number, y: number, angle: number, color: string, isLocal: boolean) {
@@ -194,9 +256,10 @@ function drawCar(ctx: CanvasRenderingContext2D, x: number, y: number, angle: num
   ctx.roundRect(-8, -7, 18, 14, 4);
   ctx.fill();
 
-  // Windows
+  // Windows (relative to the caller's alpha, so a ghost car stays see-through)
+  const baseAlpha = ctx.globalAlpha;
   ctx.fillStyle = '#38bdf8'; // Sky 400
-  ctx.globalAlpha = 0.7;
+  ctx.globalAlpha = baseAlpha * 0.7;
   // Windshield
   ctx.beginPath();
   ctx.moveTo(4, -6);
@@ -214,7 +277,7 @@ function drawCar(ctx: CanvasRenderingContext2D, x: number, y: number, angle: num
   // Side Windows
   ctx.fillRect(-3, -6.5, 6, 2);
   ctx.fillRect(-3, 4.5, 6, 2);
-  ctx.globalAlpha = 1.0;
+  ctx.globalAlpha = baseAlpha;
 
   // Spoiler
   ctx.fillStyle = '#020617';
@@ -404,6 +467,7 @@ function createExplosionBurst(x: number, y: number, accentColor: string): Explos
   });
 }
 
+
 function flattenPresencePlayers(presenceState: Record<string, PresencePlayer[]>) {
   return Object.values(presenceState).flat();
 }
@@ -412,11 +476,19 @@ function getClientTimeZone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 }
 
+/** A failed API call, keeping the HTTP status so callers can tell a rejected lap from an outage. */
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 async function requestLeaderboard(errorMessage: string, init?: RequestInit, timeZone?: string) {
   const query = timeZone ? `?timeZone=${encodeURIComponent(timeZone)}` : '';
   const response = await fetch(`/api/leaderboard${query}`, init);
   if (!response.ok) {
-    throw new Error(errorMessage);
+    const detail = await response.json().catch(() => null) as { error?: string } | null;
+    throw new ApiError(detail?.error ?? errorMessage, response.status);
   }
 
   const data = await response.json() as { leaderboard?: LeaderboardData };
@@ -425,32 +497,35 @@ async function requestLeaderboard(errorMessage: string, init?: RequestInit, time
 
 const fetchLeaderboard = (timeZone: string) => requestLeaderboard('Unable to load leaderboard', undefined, timeZone);
 
-const submitLapTime = (initials: string, timeMs: number, timeZone: string) =>
+const submitLapTime = (initials: string, timeMs: number, timeZone: string, lapToken: string) =>
   requestLeaderboard('Unable to save lap time', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ initials, timeMs, timeZone }),
+    body: JSON.stringify({ initials, timeMs, timeZone, lapToken }),
   });
 
-const resetLeaderboard = (timeZone: string) =>
-  requestLeaderboard('Unable to reset leaderboard', { method: 'DELETE' }, timeZone);
+const resetLeaderboard = (timeZone: string, adminToken: string) =>
+  requestLeaderboard('Unable to reset leaderboard', {
+    method: 'DELETE',
+    headers: { Authorization: `Bearer ${adminToken}` },
+  }, timeZone);
 
-/** Applies a car update from the network onto the stored remote player. */
-function applyCarUpdate(player: RemotePlayer, update: CarUpdate) {
-  player.x = update.x;
-  player.y = update.y;
-  player.angle = update.angle;
-  player.vx = update.vx;
-  player.vy = update.vy;
-  player.lights = update.lights;
+/** Asks the server to note when a lap started; the lap's submission must carry this token. */
+async function requestLapToken() {
+  const response = await fetch('/api/lap-start', { method: 'POST' });
+  if (!response.ok) {
+    throw new ApiError('Unable to start lap', response.status);
+  }
+  const data = await response.json() as { token?: string };
+  return typeof data.token === 'string' ? data.token : null;
 }
 
-function remoteLightStrength(player: RemotePlayer) {
+function remoteLightStrength(player: RemoteCar) {
   return player.lights === false ? 0 : 0.5;
 }
 
-function isMobileViewport() {
-  return window.matchMedia(`(max-width: ${MOBILE_HUD_BREAKPOINT - 1}px)`).matches;
+function isCompactHudViewport() {
+  return window.matchMedia(COMPACT_HUD_QUERY).matches;
 }
 
 export default function App() {
@@ -464,11 +539,14 @@ export default function App() {
   const [leaderboardStatus, setLeaderboardStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [playerInitials, setPlayerInitials] = useState('');
   const [initialsInput, setInitialsInput] = useState('');
-  const [isMobileHud, setIsMobileHud] = useState(isMobileViewport);
-  const [isHudOpen, setIsHudOpen] = useState(() => !isMobileViewport());
+  const [isCompactHud, setIsCompactHud] = useState(isCompactHudViewport);
+  const [isHudOpen, setIsHudOpen] = useState(() => !isCompactHudViewport());
   const [lapReadyToFinish, setLapReadyToFinish] = useState(false);
   const [lapCelebrationMessage, setLapCelebrationMessage] = useState<string | null>(null);
+  const [lapFlash, setLapFlash] = useState<LapFlash | null>(null);
+  const [countdown, setCountdown] = useState<string | null>(null);
   const [isResettingLeaderboard, setIsResettingLeaderboard] = useState(false);
+  const [adminToken, setAdminToken] = useState(loadAdminToken);
   const clientTimeZone = useRef(getClientTimeZone());
   const [graphicsMode, setGraphicsMode] = useState<GraphicsMode>(loadGraphicsMode);
   const graphicsModeRef = useRef(graphicsMode);
@@ -476,20 +554,23 @@ export default function App() {
   const minimapRef = useRef<HTMLCanvasElement>(null);
   const [headlightsOn, setHeadlightsOn] = useState(false);
   const headlightsOnRef = useRef(headlightsOn);
+  const [sound] = useState(() => new RaceSound());
+  const [muted, setMuted] = useState(sound.muted);
 
   // --- Multiplayer State ---
   const multiplayerRef = useRef<MultiplayerConnection | null>(null);
   const myIdRef = useRef<string | null>(null);
   const myColorRef = useRef<string>('#06b6d4');
-  const remotePlayers = useRef<Map<string, RemotePlayer>>(new Map());
+  const remotePlayers = useRef<Map<string, RemoteCar>>(new Map());
   const lastSendTime = useRef<number>(0);
   const leaderboardRef = useRef<LeaderboardData>(emptyLeaderboardData());
   const confettiParticles = useRef<ConfettiParticle[]>([]);
   const explosionParticles = useRef<ExplosionParticle[]>([]);
   const isDestroyedRef = useRef(false);
 
-  const keys = useRef<{ [key: string]: boolean }>({});
-  const car = useRef({
+  // Driving keys and touch buttons currently held, by KeyboardEvent.code or Touch* name
+  const heldKeys = useRef<Record<string, boolean>>({});
+  const car = useRef<CarState>({
     x: DEFAULT_START.x, y: DEFAULT_START.y,
     vx: 0, vy: 0,
     angle: 0,
@@ -498,16 +579,12 @@ export default function App() {
   const skidStreak = useRef<{ id: number; surface: 'road' | 'grass' | null }>({ id: 0, surface: null });
   const smokeParticles = useRef<SmokeParticle[]>([]);
   const grassParticles = useRef<GrassParticle[]>([]);
-  const gameState = useRef({
-    nextCheckpoint: 0,
-    lapStartTime: performance.now(),
-  });
 
   useEffect(() => {
-    const mediaQuery = window.matchMedia(`(max-width: ${MOBILE_HUD_BREAKPOINT - 1}px)`);
+    const mediaQuery = window.matchMedia(COMPACT_HUD_QUERY);
 
     const handleChange = (event: MediaQueryListEvent) => {
-      setIsMobileHud(event.matches);
+      setIsCompactHud(event.matches);
       setIsHudOpen(!event.matches);
     };
 
@@ -531,6 +608,15 @@ export default function App() {
       window.clearTimeout(timeoutId);
     };
   }, [lapCelebrationMessage]);
+
+  useEffect(() => {
+    if (!lapFlash) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => setLapFlash(null), LAP_FLASH_MS);
+    return () => window.clearTimeout(timeoutId);
+  }, [lapFlash]);
 
   useEffect(() => {
     leaderboardRef.current = leaderboard;
@@ -577,6 +663,12 @@ export default function App() {
     void loadLeaderboard();
   }, [loadLeaderboard]);
 
+  const toggleMute = useCallback(() => {
+    const next = !sound.muted;
+    sound.setMuted(next);
+    setMuted(next);
+  }, [sound]);
+
   useEffect(() => {
     if (!playerInitials) {
       return;
@@ -584,50 +676,104 @@ export default function App() {
 
     let cancelled = false;
 
-    const saveLapTime = async (timeMs: number) => {
-      const saved = await updateLeaderboard(() => submitLapTime(playerInitials, timeMs, clientTimeZone.current));
-      if (saved && !cancelled) {
+    const saveLapTime = async (timeMs: number, lapToken: Promise<string | null> | null) => {
+      const token = await lapToken;
+      if (cancelled) {
+        return;
+      }
+      if (!token) {
+        console.warn('Lap not saved: the server never confirmed when it started');
+        return;
+      }
+
+      try {
+        const next = await submitLapTime(playerInitials, timeMs, clientTimeZone.current, token);
+        if (cancelled) {
+          return;
+        }
+        setLeaderboard(next);
+        setLeaderboardStatus('ready');
         multiplayerRef.current?.broadcastLeaderboard();
+      } catch (error) {
+        // 400: the server did not accept the lap; 409: it was already saved
+        if (error instanceof ApiError && (error.status === 400 || error.status === 409)) {
+          console.warn(`Lap not saved: ${error.message}`);
+        } else {
+          console.error(error);
+          if (!cancelled) {
+            setLeaderboardStatus('error');
+          }
+        }
       }
     };
 
-    car.current.x = DEFAULT_START.x;
-    car.current.y = DEFAULT_START.y;
-    car.current.vx = 0;
-    car.current.vy = 0;
-    car.current.angle = 0;
+    const c = car.current;
+    Object.assign(c, { x: DEFAULT_START.x, y: DEFAULT_START.y, vx: 0, vy: 0, angle: 0 });
+    // Where the car was one physics step ago, to draw it between steps
+    const prevCar = { x: c.x, y: c.y, angle: c.angle };
     myColorRef.current = '#06b6d4';
     myIdRef.current = 'local';
     remotePlayers.current.clear();
     confettiParticles.current = [];
     explosionParticles.current = [];
     isDestroyedRef.current = false;
+    heldKeys.current = {};
+    setLap(1);
+    setLapTime(0);
     setLastLap(null);
     setLapReadyToFinish(false);
     setLapCelebrationMessage(null);
+    setLapFlash(null);
     const isVercelHost = window.location.hostname.endsWith('.vercel.app');
     multiplayerRef.current = null;
 
+    // Race state that only the game loop touches. `tick` counts physics steps
+    // since joining; lap times are measured in steps, not wall-clock time.
+    let tick = 0;
+    let lapState = createLapState();
+    let ghost: GhostLap | null = loadBestLap(playerInitials);
+    let recording: GhostRecording | null = null;
+    let lapToken: Promise<string | null> | null = null;
+    let flashCount = 0;
+    let shownCountdown: string | null = null;
+    setBestLap(ghost ? ticksToMs(ghost.ticks) : null);
+
+    const flash = (text: string, tone: LapFlash['tone']) => {
+      setLapFlash({ id: ++flashCount, text, tone });
+    };
+
+    const beginLapToken = () => {
+      lapToken = requestLapToken().catch((error) => {
+        console.warn(error);
+        return null;
+      });
+    };
+
+    /** Puts the car on a grid slot (the server or presence assigns one); the lap starts over. */
+    const placeCar = (x: number, y: number) => {
+      Object.assign(c, { x, y, vx: 0, vy: 0, angle: 0 });
+      Object.assign(prevCar, { x, y, angle: 0 });
+      lapState = createLapState();
+      recording = null;
+      lapToken = null;
+    };
+
     const syncRemotePlayersFromPresence = (players: PresencePlayer[]) => {
-      const nextPlayers = new Map<string, RemotePlayer>();
+      const nextPlayers = new Map<string, RemoteCar>();
 
       players.forEach((player) => {
         if (player.id === myIdRef.current) {
           return;
         }
 
-        const previousPlayer = remotePlayers.current.get(player.id);
-        nextPlayers.set(player.id, {
-          id: player.id,
-          initials: player.initials,
-          color: player.color,
-          x: previousPlayer?.x ?? player.x,
-          y: previousPlayer?.y ?? player.y,
-          angle: previousPlayer?.angle ?? player.angle,
-          vx: previousPlayer?.vx ?? player.vx,
-          vy: previousPlayer?.vy ?? player.vy,
-          lights: previousPlayer?.lights,
-        });
+        const existing = remotePlayers.current.get(player.id);
+        if (existing) {
+          existing.initials = player.initials;
+          existing.color = player.color;
+          nextPlayers.set(player.id, existing);
+        } else {
+          nextPlayers.set(player.id, createRemoteCar(player));
+        }
       });
 
       remotePlayers.current = nextPlayers;
@@ -644,18 +790,17 @@ export default function App() {
           if (msg.type === 'init') {
             myIdRef.current = msg.id;
             myColorRef.current = msg.color;
-            car.current.x = msg.x;
-            car.current.y = msg.y;
+            placeCar(msg.x, msg.y);
             remotePlayers.current.clear();
-            msg.players.forEach((p: RemotePlayer) => {
-              if (p.id !== msg.id) remotePlayers.current.set(p.id, p);
+            msg.players.forEach((p: PresencePlayer) => {
+              if (p.id !== msg.id) remotePlayers.current.set(p.id, createRemoteCar(p));
             });
           } else if (msg.type === 'join') {
-            remotePlayers.current.set(msg.player.id, msg.player);
+            remotePlayers.current.set(msg.player.id, createRemoteCar(msg.player));
           } else if (msg.type === 'update') {
             const p = remotePlayers.current.get(msg.id);
             if (p) {
-              applyCarUpdate(p, msg);
+              applyNetworkState(p, msg);
             }
           } else if (msg.type === 'leaderboard') {
             void loadLeaderboard();
@@ -703,12 +848,12 @@ export default function App() {
 
         const existingPlayer = remotePlayers.current.get(payload.id);
         if (existingPlayer) {
-          applyCarUpdate(existingPlayer, payload);
+          applyNetworkState(existingPlayer, payload);
           return;
         }
 
         // An update can arrive before presence tells us who this is
-        remotePlayers.current.set(payload.id, { ...payload, initials: '???', color: '#94a3b8' });
+        remotePlayers.current.set(payload.id, createRemoteCar({ ...payload, initials: '???', color: '#94a3b8' }));
       });
 
       channel.on('broadcast', { event: 'leaderboard' }, () => {
@@ -732,11 +877,7 @@ export default function App() {
 
               myIdRef.current = playerId;
               myColorRef.current = placement.color;
-              car.current.x = placement.x;
-              car.current.y = placement.y;
-              car.current.vx = 0;
-              car.current.vy = 0;
-              car.current.angle = 0;
+              placeCar(placement.x, placement.y);
 
               await channel.track({
                 id: playerId,
@@ -811,19 +952,39 @@ export default function App() {
 
     void initializeMultiplayer();
 
+    const clearHeldKeys = () => {
+      heldKeys.current = {};
+    };
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key.toLowerCase() === 'l' && !e.repeat) {
-        setHeadlightsOn((on) => !on);
+      if (isTypingTarget(e.target)) return;
+      sound.unlock();
+      if (!e.repeat) {
+        const key = e.key.toLowerCase();
+        if (key === 'l') setHeadlightsOn((on) => !on);
+        if (key === 'm') toggleMute();
       }
-      keys.current[e.key.toLowerCase()] = true;
-      if (e.code === 'Space') keys.current.space = true;
+      if (DRIVING_KEYS.has(e.code)) {
+        // Also stops Space and the arrows from pressing a focused HUD button
+        e.preventDefault();
+        heldKeys.current[e.code] = true;
+      }
     };
     const handleKeyUp = (e: KeyboardEvent) => {
-      keys.current[e.key.toLowerCase()] = false;
-      if (e.code === 'Space') keys.current.space = false;
+      if (DRIVING_KEYS.has(e.code)) {
+        e.preventDefault();
+        heldKeys.current[e.code] = false;
+      }
+    };
+    // A key released while the window is in the background never sends keyup,
+    // so forget everything held when focus or visibility is lost
+    const handleVisibilityChange = () => {
+      if (document.hidden) clearHeldKeys();
+      sound.setPageVisible(!document.hidden);
     };
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', clearHeldKeys);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -859,90 +1020,163 @@ export default function App() {
     resize();
 
     let animationId: number;
-    let cameraX = viewWidth / 2;
-    let cameraY = viewHeight / 2;
+    let cameraX = viewWidth / 2 - c.x;
+    let cameraY = viewHeight / 2 - c.y;
     let zoom = 1;
     let lastHudUpdate = 0;
+    let lastFrameTime: number | null = null;
+    const clock = createFixedClock();
+    // What the latest physics step saw, for the HUD, the renderer and the sound
+    let lastStep: StepInfo | null = null;
+    let lastInput: DriveInput = NO_INPUT;
+    let isSkidding = false;
+    let isRutting = false;
 
-    const loop = (time: number) => {
-      const c = car.current;
-      const state = gameState.current;
-      const prevX = c.x;
-      const isDestroyed = isDestroyedRef.current;
-
-      // --- Physics ---
-      const isAccelerating = !isDestroyed && (keys.current['arrowup'] || keys.current['w']);
-      const isBraking = !isDestroyed && (keys.current['arrowdown'] || keys.current['s'] || keys.current.space);
-      const isTurningLeft = !isDestroyed && (keys.current['arrowleft'] || keys.current['a']);
-      const isTurningRight = !isDestroyed && (keys.current['arrowright'] || keys.current['d']);
-      const steerInput = (isTurningRight ? 1 : 0) - (isTurningLeft ? 1 : 0);
-
-      const forwardX = Math.cos(c.angle);
-      const forwardY = Math.sin(c.angle);
-      const rightX = Math.cos(c.angle + Math.PI/2);
-      const rightY = Math.sin(c.angle + Math.PI/2);
-
-      const speed = c.vx * forwardX + c.vy * forwardY;
-      const lateralSpeed = c.vx * rightX + c.vy * rightY;
-
-      const dist = getDistanceToTrack(c);
-      const isOnTrack = dist < HALF_TRACK_WIDTH;
-      const isDrifting = isOnTrack && isBraking && steerInput !== 0 && Math.abs(speed) > 2.5;
-
-      const engineForce = isOnTrack ? 0.6 : 0.3;
-      const brakingForce = isOnTrack ? (isDrifting ? 0.22 : 0.8) : 0.4;
-      const turnSpeed = isDrifting ? 0.072 : 0.05;
-      const drag = isOnTrack ? (isDrifting ? 0.985 : 0.97) : 0.90;
-      const grip = isOnTrack ? (isDrifting ? 0.045 : 0.15) : 0.05;
-
-      if (isAccelerating) {
-        c.vx += forwardX * engineForce;
-        c.vy += forwardY * engineForce;
+    // Shows 3, 2, 1, then GO! as the countdown steps pass, with a beep for each
+    const updateCountdown = () => {
+      const remaining = COUNTDOWN_STEPS - tick;
+      const value = remaining > 0
+        ? String(Math.ceil(remaining / PHYSICS_HZ))
+        : remaining > -GO_DISPLAY_STEPS ? 'GO!' : null;
+      if (value !== shownCountdown) {
+        shownCountdown = value;
+        setCountdown(value);
+        if (value) sound.countdownBeep(value === 'GO!');
       }
-      if (isBraking) {
-        const brakeAmount = Math.min(Math.abs(speed), brakingForce);
-        const brakeDirection = speed === 0 ? 0 : Math.sign(speed);
-        c.vx -= forwardX * brakeAmount * brakeDirection;
-        c.vy -= forwardY * brakeAmount * brakeDirection;
+    };
+    updateCountdown();
+
+    const handleLapEvent = (event: LapEvent) => {
+      if (event.type === 'start') {
+        recording = startRecording(tick - lapState.startTick);
+        beginLapToken();
+        return;
       }
 
-      if (Math.abs(speed) > 0.5) {
-        const turnDir = speed > 0 ? 1 : -1;
-        if (isTurningLeft) c.angle -= turnSpeed * turnDir;
-        if (isTurningRight) c.angle += turnSpeed * turnDir;
+      if (event.type === 'checkpoint') {
+        const bestSplit = ghost?.splits[event.index];
+        if (bestSplit !== undefined) {
+          const gapMs = ticksToMs(event.ticks - bestSplit);
+          flash(formatGap(gapMs), gapMs <= 0 ? 'ahead' : 'behind');
+        }
+        return;
       }
 
-      if (isDrifting) {
-        const driftPush = Math.min(Math.abs(speed) * 0.03, 0.75);
-        c.vx += rightX * steerInput * driftPush;
-        c.vy += rightY * steerInput * driftPush;
+      // The lap just finished; the next one began at the same crossing
+      const finishedRecording = recording;
+      const finishedToken = lapToken;
+      const lapMs = ticksToMs(event.ticks);
+
+      if (playerInitials === EASTER_EGG_INITIALS) {
+        explosionParticles.current.push(...createExplosionBurst(c.x, c.y, myColorRef.current));
+        isDestroyedRef.current = true;
+        c.vx = 0;
+        c.vy = 0;
+        lapState = createLapState();
+        recording = null;
+        lapToken = null;
+        sound.crash();
+        setLapCelebrationMessage(null);
+        setSpeedMph(0);
+        setLapTime(lapMs);
+        return;
       }
 
-      // Apply lateral friction (grip)
-      c.vx -= rightX * lateralSpeed * grip;
-      c.vy -= rightY * lateralSpeed * grip;
+      recording = startRecording(tick - lapState.startTick);
+      beginLapToken();
+      setLap((n) => n + 1);
 
-      // Apply drag
-      c.vx *= drag;
-      c.vy *= drag;
-
-      // Remove any backward motion so brake input acts like a drift brake, not reverse.
-      const nextForwardSpeed = c.vx * forwardX + c.vy * forwardY;
-      if (nextForwardSpeed < 0) {
-        c.vx -= forwardX * nextForwardSpeed;
-        c.vy -= forwardY * nextForwardSpeed;
+      if (event.interrupted) {
+        flash('Lap not counted', 'warn');
+        sound.invalidLap();
+        setLapCelebrationMessage(null);
+        return;
       }
 
-      c.x += c.vx;
-      c.y += c.vy;
+      const isPersonalBest = !ghost || event.ticks < ghost.ticks;
+      if (ghost) {
+        const gapMs = lapMs - ticksToMs(ghost.ticks);
+        flash(formatGap(gapMs), gapMs <= 0 ? 'ahead' : 'behind');
+      }
+      if (isPersonalBest) {
+        ghost = {
+          ticks: event.ticks,
+          splits: event.splits,
+          offset: finishedRecording?.offset ?? 0,
+          samples: finishedRecording?.samples ?? [],
+        };
+        saveBestLap(playerInitials, ghost);
+        setBestLap(lapMs);
+      }
+      setLastLap(lapMs);
+      sound.lapChime(isPersonalBest);
+      void saveLapTime(Math.round(lapMs), finishedToken);
+
+      const placement = getBestLeaderboardPlacement(lapMs, leaderboardRef.current);
+      if (placement !== null) {
+        const confettiColors = placement < 3 ? PODIUM_CONFETTI_COLORS[placement] : CONFETTI_COLORS;
+        setLapCelebrationMessage('NEW RECORD!!!');
+        confettiParticles.current.push(
+          ...createConfettiBurst('left', viewWidth, viewHeight, confettiColors),
+          ...createConfettiBurst('right', viewWidth, viewHeight, confettiColors),
+        );
+      } else {
+        setLapCelebrationMessage(null);
+      }
+    };
+
+    const updateExplosion = () => {
+      const particles = explosionParticles.current;
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const particle = particles[i];
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        particle.vx *= 0.94;
+        particle.vy *= 0.94;
+        particle.life -= 1;
+        if (particle.life <= 0) {
+          particles.splice(i, 1);
+        }
+      }
+    };
+
+    const updateConfetti = () => {
+      const particles = confettiParticles.current;
+      for (let i = particles.length - 1; i >= 0; i--) {
+        const particle = particles[i];
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        particle.vx *= 0.992;
+        particle.vy += 0.35;
+        particle.rotation += particle.spin;
+        particle.life -= 1;
+        if (particle.life <= 0 || particle.y > viewHeight + 120) {
+          particles.splice(i, 1);
+        }
+      }
+    };
+
+    /** Everything that moves: one fixed 1/60 s step. */
+    const simulateStep = (liveInput: DriveInput) => {
+      prevCar.x = c.x;
+      prevCar.y = c.y;
+      prevCar.angle = c.angle;
+
+      const racing = tick >= COUNTDOWN_STEPS && !isDestroyedRef.current;
+      const input = racing ? liveInput : NO_INPUT;
+      const step = stepCar(c, input);
+      tick++;
+      lastStep = step;
+      lastInput = input;
+      updateCountdown();
 
       // Tyre effects are always simulated; each renderer picks what to draw
       const groundSpeed = Math.hypot(c.vx, c.vy);
-      const isSkidding = Math.abs(lateralSpeed) > (isDrifting ? 1.5 : 3) && isOnTrack;
-      const isRutting = !isOnTrack && groundSpeed > 2;
+      isSkidding = Math.abs(step.lateralSpeed) > (step.isDrifting ? 1.5 : 3) && step.isOnTrack;
+      isRutting = !step.isOnTrack && groundSpeed > 2;
       const rearWheels = [-11, 11].map(side => ({
-        x: c.x + rightX * side - forwardX * 16,
-        y: c.y + rightY * side - forwardY * 16,
+        x: c.x + step.rightX * side - step.forwardX * 16,
+        y: c.y + step.rightY * side - step.forwardY * 16,
       }));
       const markSurface = isRutting ? 'grass' : isSkidding ? 'road' : null;
       if (markSurface) {
@@ -962,7 +1196,7 @@ export default function App() {
       skidStreak.current.surface = markSurface;
       if (isRutting) {
         for (const wheel of rearWheels) {
-          spawnGrass(grassParticles.current, wheel.x, wheel.y, c.vx, c.vy, forwardX, forwardY, groundSpeed);
+          spawnGrass(grassParticles.current, wheel.x, wheel.y, c.vx, c.vy, step.forwardX, step.forwardY, groundSpeed);
         }
       }
       if (isSkidding && Math.random() < 0.7) {
@@ -979,6 +1213,41 @@ export default function App() {
         }
       }
 
+      updateExplosion();
+      updateConfetti();
+      remotePlayers.current.forEach(stepRemoteCar);
+
+      const event = updateLap(lapState, prevCar, c, tick);
+      if (event) {
+        handleLapEvent(event);
+      }
+      if (recording && lapState.running) {
+        recordSample(recording, c.x, c.y, c.angle);
+      }
+    };
+
+    const loop = (time: number) => {
+      const frameMs = lastFrameTime === null ? 0 : Math.min(100, time - lastFrameTime);
+      lastFrameTime = time;
+
+      const { steps, alpha, dropped } = advanceClock(clock, time);
+      if (dropped && lapState.running) {
+        // The game stalled (a hidden tab or a hang) and skipped time, so this lap can't be trusted
+        lapState.interrupted = true;
+      }
+      const liveInput = readDriveInput(heldKeys.current);
+      for (let i = 0; i < steps; i++) {
+        simulateStep(liveInput);
+      }
+
+      const isDestroyed = isDestroyedRef.current;
+      const groundSpeed = Math.hypot(c.vx, c.vy);
+      const pose = {
+        x: lerp(prevCar.x, c.x, alpha),
+        y: lerp(prevCar.y, c.y, alpha),
+        angle: lerp(prevCar.angle, c.angle, alpha),
+      };
+
       // --- Multiplayer Send ---
       if (multiplayerRef.current && time - lastSendTime.current > 50) {
         multiplayerRef.current.sendUpdate({
@@ -993,97 +1262,54 @@ export default function App() {
         lastSendTime.current = time;
       }
 
-      // --- Dead Reckoning for Remote Players ---
-      remotePlayers.current.forEach(p => {
-        p.x += p.vx;
-        p.y += p.vy;
+      sound.update({
+        speedRatio: groundSpeed / V2_TOP_SPEED,
+        throttle: lastInput.gas,
+        skid: isSkidding ? Math.min(1, Math.abs(lastStep?.lateralSpeed ?? 0) / 8) : 0,
+        rumble: isRutting ? Math.min(1, groundSpeed / 3) : 0,
+        running: !isDestroyed,
       });
-
-      // --- Game Logic ---
-      if (state.nextCheckpoint < checkpoints.length) {
-        const cp = checkpoints[state.nextCheckpoint];
-        if (dist2(c, cp) < 400 * 400) {
-          state.nextCheckpoint++;
-        }
-      } else {
-        if (
-          prevX < START_FINISH_X &&
-          c.x >= START_FINISH_X &&
-          Math.abs(c.y - START_FINISH_Y) < HALF_TRACK_WIDTH
-        ) {
-          if (playerInitials === EASTER_EGG_INITIALS) {
-            const currentLapTime = time - state.lapStartTime;
-            explosionParticles.current.push(...createExplosionBurst(c.x, c.y, myColorRef.current));
-            isDestroyedRef.current = true;
-            c.vx = 0;
-            c.vy = 0;
-            state.nextCheckpoint = 0;
-            state.lapStartTime = time;
-            setLapCelebrationMessage(null);
-            setSpeedMph(0);
-            setLapTime(Math.max(0, currentLapTime));
-          } else {
-          // Lap complete!
-            const currentLapTime = time - state.lapStartTime;
-            const currentLapPlacement = getBestLeaderboardPlacement(currentLapTime, leaderboardRef.current);
-            setLastLap(currentLapTime);
-            setBestLap(prev => prev === null ? currentLapTime : Math.min(prev, currentLapTime));
-            void saveLapTime(currentLapTime);
-            if (currentLapPlacement !== null) {
-              const confettiColors = currentLapPlacement < 3
-                ? PODIUM_CONFETTI_COLORS[currentLapPlacement]
-                : CONFETTI_COLORS;
-              setLapCelebrationMessage('NEW RECORD!!!');
-              confettiParticles.current.push(
-                ...createConfettiBurst('left', viewWidth, viewHeight, confettiColors),
-                ...createConfettiBurst('right', viewWidth, viewHeight, confettiColors),
-              );
-            } else {
-              setLapCelebrationMessage(null);
-            }
-            setLap(l => l + 1);
-            state.nextCheckpoint = 0;
-            state.lapStartTime = time;
-          }
-        }
-      }
 
       // Update the HUD at most ~30 times a second; re-rendering the whole
       // component every frame costs more than the readout needs
       if (time - lastHudUpdate >= HUD_UPDATE_INTERVAL_MS) {
         lastHudUpdate = time;
-        setLapReadyToFinish(state.nextCheckpoint >= checkpoints.length);
+        setLapReadyToFinish(lapState.running && lapState.nextCheckpoint >= CHECKPOINTS.length);
         if (isDestroyed) {
           setSpeedMph(0);
         } else {
-          setSpeedMph(Math.abs(Math.round(speed * 3.1)));
-          setLapTime(Math.max(0, time - state.lapStartTime));
+          setSpeedMph(Math.abs(Math.round((lastStep?.speed ?? 0) * 3.1)));
+          setLapTime(lapState.running ? ticksToMs(tick + alpha - lapState.startTick) : 0);
         }
       }
 
       // --- Camera ---
-      const targetCameraX = viewWidth / 2 - (c.x + c.vx * 15);
-      const targetCameraY = viewHeight / 2 - (c.y + c.vy * 15);
-      cameraX += (targetCameraX - cameraX) * 0.1;
-      cameraY += (targetCameraY - cameraY) * 0.1;
+      const cameraEase = easeForFrame(0.1, frameMs);
+      cameraX += (viewWidth / 2 - (pose.x + c.vx * 15) - cameraX) * cameraEase;
+      cameraY += (viewHeight / 2 - (pose.y + c.vy * 15) - cameraY) * cameraEase;
+
+      const ghostPose = ghost && lapState.running
+        ? sampleGhost(ghost, tick + alpha - lapState.startTick)
+        : null;
 
       // --- Rendering ---
       if (graphicsModeRef.current === 'v2') {
-        const speedRatio = Math.min(1, Math.hypot(c.vx, c.vy) / V2_TOP_SPEED);
+        const speedRatio = Math.min(1, groundSpeed / V2_TOP_SPEED);
         const targetZoom = (V2_ZOOM + (V2_ZOOM_AT_SPEED - V2_ZOOM) * speedRatio) * getViewportZoomScale(viewWidth, viewHeight);
-        zoom += (targetZoom - zoom) * 0.05;
-        renderV2(isDestroyed, isBraking, steerInput);
+        zoom += (targetZoom - zoom) * easeForFrame(0.05, frameMs);
+        renderV2(isDestroyed, lastInput, pose, ghostPose, alpha);
       } else {
         zoom = 1;
-        renderClassic(isDestroyed);
+        renderClassic(isDestroyed, pose, ghostPose, alpha);
       }
 
       animationId = requestAnimationFrame(loop);
     };
 
+    type Pose = { x: number; y: number; angle: number };
+
     // Draws the world in V2 style around the camera focus, then screen overlays.
-    const renderV2 = (isDestroyed: boolean, isBraking: boolean, steerInput: number) => {
-      const c = car.current;
+    const renderV2 = (isDestroyed: boolean, input: DriveInput, pose: Pose, ghostPose: Pose | null, alpha: number) => {
       ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
 
       const focusX = viewWidth / 2 - cameraX;
@@ -1102,26 +1328,34 @@ export default function App() {
       drawSmoke(ctx, smokeParticles.current);
       drawGrass(ctx, grassParticles.current);
 
-      const localLights = headlightsOnRef.current && !isDestroyed ? 1 : 0;
+      if (ghostPose) {
+        ctx.save();
+        ctx.globalAlpha = GHOST_ALPHA;
+        drawCarV2(ctx, ghostPose.x, ghostPose.y, ghostPose.angle, GHOST_COLOR);
+        ctx.restore();
+      }
 
-      remotePlayers.current.forEach(p => {
-        drawCarV2(ctx, p.x, p.y, p.angle, p.color, { lights: remoteLightStrength(p) });
+      const localLights = headlightsOnRef.current && !isDestroyed ? 1 : 0;
+      const remotes = Array.from(remotePlayers.current.values(), (player: RemoteCar) => ({ player, ...remoteDrawState(player, alpha) }));
+
+      remotes.forEach(({ player, x, y, angle }) => {
+        drawCarV2(ctx, x, y, angle, player.color, { lights: remoteLightStrength(player) });
       });
 
       drawExplosion();
 
       if (!isDestroyed) {
-        drawCarV2(ctx, c.x, c.y, c.angle, myColorRef.current, { steer: steerInput, braking: isBraking, lights: localLights });
+        drawCarV2(ctx, pose.x, pose.y, pose.angle, myColorRef.current, { steer: input.steer, braking: input.brake, lights: localLights });
       }
 
       // Headlights go on after the cars so they light up any bodywork they hit,
       // with shadows cut out behind every car in a beam. Cars whose beams
       // cannot reach the screen are skipped, and so is the layer if none can.
       const cars = [
-        ...Array.from(remotePlayers.current.values(), (p: RemotePlayer) => ({
-          id: p.id, x: p.x, y: p.y, angle: p.angle, strength: remoteLightStrength(p) * 0.9,
+        ...remotes.map(({ player, x, y, angle }) => ({
+          id: player.id, x, y, angle, strength: remoteLightStrength(player) * 0.9,
         })),
-        ...(isDestroyed ? [] : [{ id: myIdRef.current ?? 'local', x: c.x, y: c.y, angle: c.angle, strength: localLights }]),
+        ...(isDestroyed ? [] : [{ id: myIdRef.current ?? 'local', ...pose, strength: localLights }]),
       ];
       const reachX = halfW + HEADLIGHT_REACH;
       const reachY = halfH + HEADLIGHT_REACH;
@@ -1144,8 +1378,8 @@ export default function App() {
       }
 
       // Tags last so no car ever covers a name
-      remotePlayers.current.forEach(p => {
-        drawDriverTag(ctx, p.x, p.y, p.initials, p.color);
+      remotes.forEach(({ player, x, y }) => {
+        drawDriverTag(ctx, x, y, player.initials, player.color);
       });
 
       ctx.restore();
@@ -1156,26 +1390,15 @@ export default function App() {
       if (minimap) {
         drawMinimap(
           minimap,
-          { x: c.x, y: c.y, angle: c.angle, color: myColorRef.current },
-          remotePlayers.current.values(),
+          { ...pose, color: myColorRef.current },
+          remotes.map(({ player, x, y }) => ({ x, y, color: player.color })),
+          ghostPose,
         );
       }
     };
 
     const drawExplosion = () => {
-      for (let i = explosionParticles.current.length - 1; i >= 0; i--) {
-        const particle = explosionParticles.current[i];
-        particle.x += particle.vx;
-        particle.y += particle.vy;
-        particle.vx *= 0.94;
-        particle.vy *= 0.94;
-        particle.life -= 1;
-
-        if (particle.life <= 0) {
-          explosionParticles.current.splice(i, 1);
-          continue;
-        }
-
+      for (const particle of explosionParticles.current) {
         ctx.save();
         ctx.translate(particle.x, particle.y);
         ctx.globalAlpha = Math.min(1, particle.life / 16);
@@ -1190,20 +1413,7 @@ export default function App() {
     };
 
     const drawConfetti = () => {
-      for (let i = confettiParticles.current.length - 1; i >= 0; i--) {
-        const particle = confettiParticles.current[i];
-        particle.x += particle.vx;
-        particle.y += particle.vy;
-        particle.vx *= 0.992;
-        particle.vy += 0.35;
-        particle.rotation += particle.spin;
-        particle.life -= 1;
-
-        if (particle.life <= 0 || particle.y > viewHeight + 120) {
-          confettiParticles.current.splice(i, 1);
-          continue;
-        }
-
+      for (const particle of confettiParticles.current) {
         ctx.save();
         ctx.translate(particle.x, particle.y);
         ctx.rotate(particle.rotation);
@@ -1222,8 +1432,7 @@ export default function App() {
       }
     };
 
-    const renderClassic = (isDestroyed: boolean) => {
-      const c = car.current;
+    const renderClassic = (isDestroyed: boolean, pose: Pose, ghostPose: Pose | null, alpha: number) => {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
 
       ctx.fillStyle = '#166534'; // Grass
@@ -1275,7 +1484,7 @@ export default function App() {
       const startFinishTop = -startFinishHalfHeight;
       const startFinishHeight = startFinishHalfHeight * 2;
       ctx.rotate(Math.atan2(dy, dx));
-      
+
       ctx.fillStyle = '#fff';
       ctx.fillRect(-START_FINISH_LINE_WIDTH / 2, startFinishTop, START_FINISH_LINE_WIDTH, startFinishHeight);
       ctx.fillStyle = '#000';
@@ -1294,17 +1503,25 @@ export default function App() {
         ctx.fill();
       });
 
+      if (ghostPose) {
+        ctx.save();
+        ctx.globalAlpha = GHOST_ALPHA;
+        drawCar(ctx, ghostPose.x, ghostPose.y, ghostPose.angle, GHOST_COLOR, false);
+        ctx.restore();
+      }
+
       // Remote Cars
       remotePlayers.current.forEach(p => {
-        drawCar(ctx, p.x, p.y, p.angle, p.color, false);
-        drawDriverTag(ctx, p.x, p.y, p.initials, p.color);
+        const { x, y, angle } = remoteDrawState(p, alpha);
+        drawCar(ctx, x, y, angle, p.color, false);
+        drawDriverTag(ctx, x, y, p.initials, p.color);
       });
 
       // Local Car
       drawExplosion();
 
       if (!isDestroyed) {
-        drawCar(ctx, c.x, c.y, c.angle, myColorRef.current, headlightsOnRef.current);
+        drawCar(ctx, pose.x, pose.y, pose.angle, myColorRef.current, headlightsOnRef.current);
       }
 
       ctx.restore();
@@ -1323,6 +1540,8 @@ export default function App() {
       resizeCanvasRef.current = null;
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', clearHeldKeys);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [playerInitials]);
 
@@ -1333,11 +1552,13 @@ export default function App() {
       return;
     }
 
+    // Submitting the form is a user gesture, which browsers require before audio can play
+    sound.unlock();
     setPlayerInitials(nextInitials);
   };
 
   const handleResetLeaderboard = async () => {
-    if (isResettingLeaderboard) {
+    if (isResettingLeaderboard || !adminToken) {
       return;
     }
 
@@ -1347,9 +1568,20 @@ export default function App() {
     }
 
     setIsResettingLeaderboard(true);
-    if (await updateLeaderboard(() => resetLeaderboard(clientTimeZone.current))) {
+    try {
+      setLeaderboard(await resetLeaderboard(clientTimeZone.current, adminToken));
+      setLeaderboardStatus('ready');
       setLapCelebrationMessage(null);
       multiplayerRef.current?.broadcastLeaderboard();
+    } catch (error) {
+      console.error(error);
+      if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+        forgetAdminToken();
+        setAdminToken(null);
+        window.alert(`Reset refused: ${error.message}`);
+      } else {
+        setLeaderboardStatus('error');
+      }
     }
     setIsResettingLeaderboard(false);
   };
@@ -1405,15 +1637,23 @@ export default function App() {
     </div>
   );
 
-  // Press-and-hold handlers for an on-screen control that stands in for a key
+  // Press-and-hold handlers for an on-screen control that stands in for a key.
+  // Sliding off the button, or the system cancelling the touch, lets go.
   const holdKey = (key: string) => {
     const set = (down: boolean) => (event: React.PointerEvent) => {
       event.preventDefault();
-      keys.current[key] = down;
+      heldKeys.current[key] = down;
     };
-    return { onPointerDown: set(true), onPointerUp: set(false), onPointerLeave: set(false) };
+    return {
+      onPointerDown: set(true),
+      onPointerUp: set(false),
+      onPointerLeave: set(false),
+      onPointerCancel: set(false),
+    };
   };
   const controlButtonClass = 'bg-black/50 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-white/30 select-none touch-none';
+  // Gas, brake and steering buttons are for touch; mouse-and-keyboard players drive with keys
+  const touchOnlyClass = '[@media(pointer:fine)]:hidden';
 
   const hudToggleButton = (
     <button
@@ -1485,13 +1725,49 @@ export default function App() {
     </div>
   );
 
+  const soundToggle = (
+    <div className="mb-4 flex items-center justify-between gap-3">
+      <span className="text-xs uppercase tracking-widest text-gray-400">Sound</span>
+      <button
+        aria-label={muted ? 'Turn sound on (M)' : 'Turn sound off (M)'}
+        aria-pressed={!muted}
+        className={`pointer-events-auto flex w-28 items-center justify-center gap-2 rounded-full border py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors ${
+          muted ? 'border-white/10 bg-white/5 text-white/50 hover:text-white/80' : 'border-orange-300/30 bg-orange-400/15 text-orange-100'
+        }`}
+        onClick={() => {
+          sound.unlock();
+          toggleMute();
+        }}
+        title="Sound (M)"
+        type="button"
+      >
+        <svg aria-hidden="true" fill="none" height="14" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="14">
+          <path d="M11 5 6 9H2v6h4l5 4V5Z" />
+          {muted ? (
+            <>
+              <path d="m22 9-6 6" />
+              <path d="m16 9 6 6" />
+            </>
+          ) : (
+            <>
+              <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+              <path d="M19 5a10 10 0 0 1 0 14" />
+            </>
+          )}
+        </svg>
+        {muted ? 'Off' : 'On'}
+      </button>
+    </div>
+  );
+
   const hudDetails = (
     <>
       <h1 className="mb-1 bg-gradient-to-r from-rose-400 to-orange-400 bg-clip-text text-xl font-black italic tracking-wider text-transparent sm:text-2xl">
         APEX RACER
       </h1>
-      <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive, L for lights</p>
+      <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive, L for lights, M for sound</p>
       {graphicsToggle}
+      {soundToggle}
 
       <div className="space-y-2 font-mono">
         <div className="flex items-center justify-between gap-4 sm:gap-6">
@@ -1514,16 +1790,18 @@ export default function App() {
         <div className="mt-4 border-t border-white/10 pt-3">
           <div className="mb-2 flex items-center justify-between gap-3">
             <span className="text-xs uppercase tracking-widest text-gray-400">Top {LEADERBOARD_LIMIT} Today</span>
-            <button
-              className="pointer-events-auto rounded-full border border-rose-400/25 bg-rose-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.25em] text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={isResettingLeaderboard || isLeaderboardLoading}
-              onClick={() => {
-                void handleResetLeaderboard();
-              }}
-              type="button"
-            >
-              {isResettingLeaderboard ? 'Resetting' : 'Reset'}
-            </button>
+            {adminToken && (
+              <button
+                className="pointer-events-auto rounded-full border border-rose-400/25 bg-rose-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.25em] text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={isResettingLeaderboard || isLeaderboardLoading}
+                onClick={() => {
+                  void handleResetLeaderboard();
+                }}
+                type="button"
+              >
+                {isResettingLeaderboard ? 'Resetting' : 'Reset'}
+              </button>
+            )}
           </div>
           {renderLeaderboardList(leaderboard.today, 'today')}
           {leaderboardStatus === 'error' && (
@@ -1534,10 +1812,16 @@ export default function App() {
     </>
   );
 
+  const lapFlashClass = lapFlash?.tone === 'ahead'
+    ? 'border-emerald-200/40 bg-emerald-500/85 font-mono text-lg tabular-nums'
+    : lapFlash?.tone === 'behind'
+      ? 'border-rose-200/40 bg-rose-500/85 font-mono text-lg tabular-nums'
+      : 'border-white/15 bg-slate-950/85 text-xs uppercase tracking-[0.3em] text-amber-200';
+
   return (
     <div className="fixed inset-0 overflow-hidden bg-green-900 font-sans">
       <canvas ref={canvasRef} className="block h-full w-full touch-none" />
-      
+
       {isV2 && (
         // Vignette as CSS so it is composited once instead of painted every frame
         <div
@@ -1549,13 +1833,14 @@ export default function App() {
 
       {/* HUD */}
       <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] left-[max(1rem,env(safe-area-inset-left))] z-20 flex flex-col gap-3 sm:top-[max(1.5rem,env(safe-area-inset-top))] sm:left-[max(1.5rem,env(safe-area-inset-left))]">
-        {(isMobileHud || !isHudOpen) && compactHud}
-        {isHudOpen && (isMobileHud ? (
-          <div className="pointer-events-auto max-h-[min(70vh,28rem)] w-[min(18rem,calc(100vw-2rem))] overflow-y-auto rounded-3xl border border-white/10 bg-black/70 p-4 text-white shadow-2xl backdrop-blur-md">
+        {(isCompactHud || !isHudOpen) && compactHud}
+        {isHudOpen && (isCompactHud ? (
+          // Stops short of the driving controls at the bottom of the screen
+          <div className="pointer-events-auto max-h-[min(28rem,calc(100dvh-13rem))] w-[min(18rem,calc(100vw-2rem))] overflow-y-auto rounded-3xl border border-white/10 bg-black/70 p-4 text-white shadow-2xl backdrop-blur-md">
             {hudDetails}
           </div>
         ) : (
-          <div className="pointer-events-auto relative w-72 rounded-2xl border border-white/10 bg-black/60 p-5 pr-16 text-white shadow-xl backdrop-blur-md">
+          <div className="pointer-events-auto relative max-h-[calc(100dvh-3rem)] w-72 overflow-y-auto rounded-2xl border border-white/10 bg-black/60 p-5 pr-16 text-white shadow-xl backdrop-blur-md">
             <div className="absolute right-4 top-4">
               {hudToggleButton}
             </div>
@@ -1564,11 +1849,35 @@ export default function App() {
         ))}
       </div>
 
-      {lapCelebrationMessage && (
-        <div className="pointer-events-none absolute top-5 left-1/2 z-30 -translate-x-1/2 px-4 sm:top-6">
-          <div className="animate-pulse rounded-full border border-amber-200/40 bg-gradient-to-r from-amber-500/85 to-orange-500/85 px-5 py-3 text-center text-xs font-black uppercase tracking-[0.32em] text-white shadow-2xl backdrop-blur-md sm:text-sm">
+      {/* Lap messages: below the top HUD on phones, at the top otherwise */}
+      <div className="pointer-events-none absolute top-[36%] left-1/2 z-30 flex -translate-x-1/2 flex-col items-center gap-2 px-4 sm:top-6">
+        {lapCelebrationMessage && (
+          <div className="animate-pulse whitespace-nowrap rounded-full border border-amber-200/40 bg-gradient-to-r from-amber-500/85 to-orange-500/85 px-5 py-3 text-center text-xs font-black uppercase tracking-[0.32em] text-white shadow-2xl backdrop-blur-md sm:text-sm">
             {lapCelebrationMessage}
           </div>
+        )}
+        {lapFlash && (
+          <div
+            aria-live="polite"
+            className={`whitespace-nowrap rounded-full border px-4 py-2 text-center font-black text-white shadow-xl backdrop-blur-md ${lapFlashClass}`}
+            key={lapFlash.id}
+          >
+            {lapFlash.text}
+          </div>
+        )}
+      </div>
+
+      {countdown && (
+        // Above centre, so the car on the grid stays in view
+        <div aria-live="assertive" className="pointer-events-none absolute inset-0 z-30 flex items-start justify-center pt-[18vh]">
+          <span
+            className={`countdown-pop text-8xl font-black italic tracking-tighter drop-shadow-[0_6px_24px_rgba(0,0,0,0.6)] sm:text-9xl ${
+              countdown === 'GO!' ? 'text-emerald-300' : 'text-white'
+            }`}
+            key={countdown}
+          >
+            {countdown}
+          </span>
         </div>
       )}
 
@@ -1596,18 +1905,18 @@ export default function App() {
         </div>
       )}
 
-      {/* On-screen Controls */}
-      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] left-[max(2rem,env(safe-area-inset-left))] flex gap-4">
-        <button aria-label="Steer left" className={`h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('arrowleft')}>
+      {/* On-screen Controls, above the HUD so a panel can never block them */}
+      <div className={`absolute bottom-[max(2rem,env(safe-area-inset-bottom))] left-[max(2rem,env(safe-area-inset-left))] z-30 flex gap-4 ${touchOnlyClass}`}>
+        <button aria-label="Steer left" className={`h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('TouchLeft')}>
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
         </button>
-        <button aria-label="Steer right" className={`h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('arrowright')}>
+        <button aria-label="Steer right" className={`h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('TouchRight')}>
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m9 18 6-6-6-6"/></svg>
         </button>
       </div>
 
-      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] flex gap-4 items-end [@media(max-height:30rem)]:bottom-[max(1rem,env(safe-area-inset-bottom))]">
-        <button className={`mb-2 h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('arrowdown')}>
+      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] z-30 flex gap-4 items-end [@media(max-height:30rem)]:bottom-[max(1rem,env(safe-area-inset-bottom))]">
+        <button className={`mb-2 h-16 w-16 ${controlButtonClass} ${touchOnlyClass}`} type="button" {...holdKey('TouchBrake')}>
           <span className="font-bold text-xs uppercase tracking-wider">Brake</span>
         </button>
         <div className="flex flex-col items-center gap-6 [@media(max-height:30rem)]:gap-3">
@@ -1632,9 +1941,9 @@ export default function App() {
             </svg>
           </button>
           <button
-            className="w-20 h-20 bg-rose-500/80 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-rose-400 select-none touch-none"
+            className={`w-20 h-20 bg-rose-500/80 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-rose-400 select-none touch-none ${touchOnlyClass}`}
             type="button"
-            {...holdKey('arrowup')}
+            {...holdKey('TouchGas')}
           >
             <span className="font-bold text-sm uppercase tracking-wider">Gas</span>
           </button>
@@ -1642,7 +1951,7 @@ export default function App() {
       </div>
 
       {!playerInitials && (
-        <div className="absolute inset-0 flex items-center justify-center bg-slate-950/55 backdrop-blur-sm px-6">
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-slate-950/55 backdrop-blur-sm px-6">
           <form
             onSubmit={handleJoin}
             className="w-full max-w-sm rounded-3xl border border-white/10 bg-black/70 p-7 text-white shadow-2xl"

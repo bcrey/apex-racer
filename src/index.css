@@ -9,3 +9,32 @@ body,
   overflow: hidden;
   overscroll-behavior: none;
 }
+
+/* Countdown numbers: drop in, hold, fade. Each number remounts, so it replays. */
+@keyframes countdown-pop {
+  0% {
+    opacity: 0;
+    transform: scale(1.6);
+  }
+  18% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.92);
+  }
+}
+
+.countdown-pop {
+  animation: countdown-pop 1s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .countdown-pop {
+    animation: none;
+  }
+}

@@ -740,6 +740,7 @@ export function drawMinimap(
   canvas: HTMLCanvasElement,
   local: MinimapCar & { angle: number },
   others: Iterable<MinimapCar>,
+  ghost?: Point | null,
 ) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const width = canvas.clientWidth;
@@ -764,6 +765,15 @@ export function drawMinimap(
   const scale = minimapScale(width, height);
   const mapX = (x: number) => MINIMAP_PAD + (x - MINIMAP_BOUNDS.minX) * scale;
   const mapY = (y: number) => MINIMAP_PAD + (y - MINIMAP_BOUNDS.minY) * scale;
+
+  // Best-lap ghost as a hollow ring, under the real cars
+  if (ghost) {
+    ctx.strokeStyle = 'rgba(226, 232, 240, 0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(mapX(ghost.x), mapY(ghost.y), 3.5, 0, Math.PI * 2);
+    ctx.stroke();
+  }
 
   for (const car of others) {
     ctx.fillStyle = car.color;

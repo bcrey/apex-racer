@@ -1,7 +1,10 @@
 import {
+  DuplicateLapError,
   getLeaderboardData,
   hasLeaderboardDatabase,
   isDirectSupabaseIpv6Error,
+  isLeaderboardAdmin,
+  leaderboardAdminRefusal,
   parseLapSubmission,
   recordLapTime,
   resetLeaderboardData,
@@ -63,11 +66,25 @@ async function saveLeaderboard(request: Request) {
 
   return withDatabase(
     { log: 'Unable to save leaderboard entry', message: 'Leaderboard unavailable', status: 503 },
-    async () => json({ leaderboard: await recordLapTime(lap.initials, lap.timeMs, lap.timeZone) }, { status: 201 }),
+    async () => {
+      try {
+        return json({ leaderboard: await recordLapTime(lap.initials, lap.timeMs, lap.timeZone, lap.lapToken) }, { status: 201 });
+      } catch (error) {
+        if (error instanceof DuplicateLapError) {
+          return json({ error: error.message }, { status: 409 });
+        }
+        throw error;
+      }
+    },
   );
 }
 
 function clearLeaderboard(request: Request) {
+  if (!isLeaderboardAdmin(request.headers.get('authorization'))) {
+    const refusal = leaderboardAdminRefusal();
+    return json({ error: refusal.error }, { status: refusal.status });
+  }
+
   return withDatabase(
     { log: 'Unable to reset today leaderboard', message: 'Unable to reset today leaderboard', status: 500 },
     async () => json({ leaderboard: await resetLeaderboardData(timeZoneParam(request)) }),

@@ -1,9 +1,13 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import {
+  DuplicateLapError,
   ensureLeaderboardTable,
   getLeaderboardData,
   isDirectSupabaseIpv6Error,
+  isLeaderboardAdmin,
+  issueLapToken,
+  leaderboardAdminRefusal,
   parseLapSubmission,
   recordLapTime,
   resetLeaderboardData,
@@ -63,6 +67,11 @@ async function startServer() {
     res.json({ status: 'ok' });
   });
 
+  // Marks the start of a lap by the server's clock; the lap's submission must carry it
+  app.post('/api/lap-start', (_req, res) => {
+    res.set('Cache-Control', 'no-store').json({ token: issueLapToken() });
+  });
+
   app.get('/api/leaderboard', async (req, res) => {
     try {
       const leaderboard = await getLeaderboardData(queryTimeZone(req.query.timeZone));
@@ -81,16 +90,26 @@ async function startServer() {
     }
 
     try {
-      const leaderboard = await recordLapTime(lap.initials, lap.timeMs, lap.timeZone);
+      const leaderboard = await recordLapTime(lap.initials, lap.timeMs, lap.timeZone, lap.lapToken);
       sendLeaderboardToClients?.();
       res.status(201).json({ leaderboard });
     } catch (error) {
+      if (error instanceof DuplicateLapError) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
       console.error('Unable to save leaderboard entry', error);
       res.status(503).json({ error: 'Leaderboard unavailable' });
     }
   });
 
   app.delete('/api/leaderboard', async (req, res) => {
+    if (!isLeaderboardAdmin(req.get('authorization'))) {
+      const refusal = leaderboardAdminRefusal();
+      res.status(refusal.status).json({ error: refusal.error });
+      return;
+    }
+
     try {
       const leaderboard = await resetLeaderboardData(queryTimeZone(req.query.timeZone));
       sendLeaderboardToClients?.();
