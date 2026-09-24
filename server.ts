@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import express from 'express';
 import {
+  checkDatabaseHealth,
   ensureLeaderboardTable,
   getLeaderboardData,
   isDirectSupabaseIpv6Error,
@@ -59,8 +60,15 @@ async function startServer() {
   let sendLeaderboardToClients: (() => void) | null = null;
 
   // API routes FIRST
-  app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok' });
+  app.get('/api/health', async (_req, res) => {
+    res.set('cache-control', 'no-store');
+    try {
+      const { laps } = await checkDatabaseHealth();
+      res.json({ status: 'ok', database: 'ok', laps, checkedAt: new Date().toISOString() });
+    } catch (error) {
+      console.error('Health check failed', error);
+      res.status(503).json({ status: 'error', database: 'unreachable', checkedAt: new Date().toISOString() });
+    }
   });
 
   app.get('/api/leaderboard', async (req, res) => {

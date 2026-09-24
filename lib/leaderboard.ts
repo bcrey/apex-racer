@@ -132,6 +132,23 @@ export function parseLapSubmission(body: { initials?: unknown; timeMs?: unknown;
   };
 }
 
+/**
+ * Reads the database for health checks. A real query on a real table counts
+ * as activity, which keeps a free Supabase project from pausing when idle.
+ */
+export async function checkDatabaseHealth() {
+  const sql = getSqlClient();
+  if (!sql) {
+    throw new Error('Leaderboard database is not configured');
+  }
+
+  await ensureLeaderboardTable();
+  const [{ laps }] = await sql<{ laps: number }[]>`
+    select count(*)::int as laps from leaderboard_laps
+  `;
+  return { laps };
+}
+
 export async function getLeaderboardData(timeZone: string | null | undefined) {
   const sql = getSqlClient();
   if (!sql) {
