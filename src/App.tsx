@@ -1577,7 +1577,9 @@ export default function App() {
           <SpeedGauge mph={speedMph} />
           <canvas
             aria-label="Track map"
-            className="w-24 rounded-2xl border border-white/10 bg-black/55 shadow-xl backdrop-blur-md sm:w-36"
+            // Height leaves room for the gauge above and the gas/headlight stack
+            // below; width follows from the aspect ratio. Hidden on very short screens.
+            className="h-[min(7.75rem,calc(100dvh-21rem))] w-auto rounded-2xl border border-white/10 bg-black/55 shadow-xl backdrop-blur-md sm:h-[min(11.75rem,calc(100dvh-24rem))] [@media(max-height:30rem)]:hidden"
             ref={minimapRef}
             role="img"
             style={{ aspectRatio: MINIMAP_ASPECT }}
@@ -1604,11 +1606,11 @@ export default function App() {
         </button>
       </div>
 
-      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] flex gap-4 items-end">
+      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] flex gap-4 items-end [@media(max-height:30rem)]:bottom-[max(1rem,env(safe-area-inset-bottom))]">
         <button className={`mb-2 h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('arrowdown')}>
           <span className="font-bold text-xs uppercase tracking-wider">Brake</span>
         </button>
-        <div className="flex flex-col items-center gap-6">
+        <div className="flex flex-col items-center gap-6 [@media(max-height:30rem)]:gap-3">
           <button
             aria-label={headlightsOn ? 'Turn headlights off (L)' : 'Turn headlights on (L)'}
             aria-pressed={headlightsOn}

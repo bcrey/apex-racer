@@ -744,6 +744,7 @@ export function drawMinimap(
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const width = canvas.clientWidth;
   const height = canvas.clientHeight;
+  if (width === 0 || height === 0) return;
   let state = minimapStates.get(canvas);
   if (!state || state.width !== width || state.height !== height || state.dpr !== dpr) {
     const ctx = state?.ctx ?? canvas.getContext('2d');

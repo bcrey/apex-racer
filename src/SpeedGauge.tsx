@@ -33,7 +33,7 @@ const TICKS = Array.from({ length: MAX_MPH / TICK_STEP_MPH + 1 }, (_, i) => {
 
 function SpeedGauge({ mph }: { mph: number }) {
   return (
-    <div className="relative flex h-28 w-28 items-center justify-center rounded-full border border-white/10 bg-black/60 text-white shadow-xl backdrop-blur-md sm:h-36 sm:w-36">
+    <div className="relative flex h-28 w-28 items-center justify-center rounded-full border border-white/10 bg-black/60 text-white shadow-xl backdrop-blur-md sm:h-36 sm:w-36 [@media(max-height:30rem)]:h-24 [@media(max-height:30rem)]:w-24">
       <svg aria-hidden="true" className="absolute inset-0 h-full w-full" viewBox="0 0 100 100">
         {/* One glow filter on the lit group rather than one per tick */}
         <g>
@@ -48,7 +48,7 @@ function SpeedGauge({ mph }: { mph: number }) {
         </g>
       </svg>
       <div className="flex flex-col items-center">
-        <span className="text-4xl font-black italic tabular-nums tracking-tighter sm:text-5xl">{mph}</span>
+        <span className="text-4xl font-black italic tabular-nums tracking-tighter sm:text-5xl [@media(max-height:30rem)]:text-3xl">{mph}</span>
         <span className="text-[10px] font-bold uppercase tracking-[0.3em] text-rose-400 sm:text-xs">mph</span>
       </div>
     </div>
