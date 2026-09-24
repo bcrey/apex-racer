@@ -474,7 +474,7 @@ export default function App() {
   const graphicsModeRef = useRef(graphicsMode);
   const resizeCanvasRef = useRef<(() => void) | null>(null);
   const minimapRef = useRef<HTMLCanvasElement>(null);
-  const [headlightsOn, setHeadlightsOn] = useState(true);
+  const [headlightsOn, setHeadlightsOn] = useState(false);
   const headlightsOnRef = useRef(headlightsOn);
 
   // --- Multiplayer State ---
