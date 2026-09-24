@@ -1905,8 +1905,8 @@ export default function App() {
         </div>
       )}
 
-      {/* On-screen Controls, above the HUD so a panel can never block them */}
-      <div className={`absolute bottom-[max(2rem,env(safe-area-inset-bottom))] left-[max(2rem,env(safe-area-inset-left))] z-30 flex gap-4 ${touchOnlyClass}`}>
+      {/* On-screen Controls. The compact HUD panel's height is capped to stop above them. */}
+      <div className={`absolute bottom-[max(2rem,env(safe-area-inset-bottom))] left-[max(2rem,env(safe-area-inset-left))] flex gap-4 ${touchOnlyClass}`}>
         <button aria-label="Steer left" className={`h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('TouchLeft')}>
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
         </button>
@@ -1915,7 +1915,7 @@ export default function App() {
         </button>
       </div>
 
-      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] z-30 flex gap-4 items-end [@media(max-height:30rem)]:bottom-[max(1rem,env(safe-area-inset-bottom))]">
+      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] flex gap-4 items-end [@media(max-height:30rem)]:bottom-[max(1rem,env(safe-area-inset-bottom))]">
         <button className={`mb-2 h-16 w-16 ${controlButtonClass} ${touchOnlyClass}`} type="button" {...holdKey('TouchBrake')}>
           <span className="font-bold text-xs uppercase tracking-wider">Brake</span>
         </button>
@@ -1951,7 +1951,7 @@ export default function App() {
       </div>
 
       {!playerInitials && (
-        <div className="absolute inset-0 z-40 flex items-center justify-center bg-slate-950/55 backdrop-blur-sm px-6">
+        <div className="absolute inset-0 flex items-center justify-center bg-slate-950/55 backdrop-blur-sm px-6">
           <form
             onSubmit={handleJoin}
             className="w-full max-w-sm rounded-3xl border border-white/10 bg-black/70 p-7 text-white shadow-2xl"
