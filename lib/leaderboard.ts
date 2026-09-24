@@ -1,18 +1,16 @@
 import postgres from 'postgres';
+import {
+  emptyLeaderboardData,
+  LEADERBOARD_LIMIT,
+  normalizeInitials,
+  type LeaderboardData,
+  type LeaderboardEntry,
+} from './leaderboardShared.js';
 
-export type LeaderboardEntry = {
-  initials: string;
-  timeMs: number;
-};
-
-export type LeaderboardData = {
-  allTime: LeaderboardEntry[];
-  today: LeaderboardEntry[];
-};
+export type { LeaderboardData, LeaderboardEntry };
 
 let sqlClient: postgres.Sql | null | undefined;
 let leaderboardReadyPromise: Promise<void> | null = null;
-const LEADERBOARD_LIMIT = 5;
 
 export function hasLeaderboardDatabase() {
   return Boolean(process.env.DATABASE_URL);
@@ -37,6 +35,10 @@ function createSqlClient(databaseUrl: string) {
     password,
     ssl: 'require',
     prepare: !isSupabaseTransactionPooler,
+    // Serverless instances stay warm between requests; hold few connections
+    // and let idle ones go so they do not exhaust the Supabase pooler.
+    max: 2,
+    idle_timeout: 20,
   });
 }
 
@@ -53,8 +55,7 @@ function getSqlClient() {
 }
 
 export function sanitizeInitials(value: string | null | undefined) {
-  const cleaned = (value ?? '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3);
-  return cleaned || '???';
+  return normalizeInitials(value) || '???';
 }
 
 export function sanitizeTimeZone(value: string | null | undefined) {
@@ -117,14 +118,21 @@ export async function ensureLeaderboardTable() {
   }
 }
 
-function emptyLeaderboardData(): LeaderboardData {
+/** Validates a POST body from either server; the error is the 400 message. */
+export function parseLapSubmission(body: { initials?: unknown; timeMs?: unknown; timeZone?: unknown } | null | undefined) {
+  const timeMs = Math.round(Number(body?.timeMs));
+  if (!Number.isFinite(timeMs) || timeMs <= 0) {
+    return { error: 'A valid lap time is required' } as const;
+  }
+
   return {
-    allTime: [],
-    today: [],
+    initials: sanitizeInitials(typeof body?.initials === 'string' ? body.initials : undefined),
+    timeMs,
+    timeZone: typeof body?.timeZone === 'string' ? body.timeZone : undefined,
   };
 }
 
-export async function getLeaderboardData(timeZone: string) {
+export async function getLeaderboardData(timeZone: string | null | undefined) {
   const sql = getSqlClient();
   if (!sql) {
     return emptyLeaderboardData();
@@ -163,7 +171,7 @@ export async function getLeaderboardData(timeZone: string) {
   } satisfies LeaderboardData;
 }
 
-export async function recordLapTime(initials: string, timeMs: number, timeZone: string) {
+export async function recordLapTime(initials: string, timeMs: number, timeZone: string | null | undefined) {
   const sql = getSqlClient();
   if (!sql) {
     throw new Error('Leaderboard database is not configured');
@@ -179,7 +187,7 @@ export async function recordLapTime(initials: string, timeMs: number, timeZone: 
   return getLeaderboardData(timeZone);
 }
 
-export async function resetLeaderboardData(timeZone: string) {
+export async function resetLeaderboardData(timeZone: string | null | undefined) {
   const sql = getSqlClient();
   if (!sql) {
     throw new Error('Leaderboard database is not configured');

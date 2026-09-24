@@ -4,11 +4,12 @@ import {
   ensureLeaderboardTable,
   getLeaderboardData,
   isDirectSupabaseIpv6Error,
+  parseLapSubmission,
   recordLapTime,
   resetLeaderboardData,
   sanitizeInitials,
-  sanitizeTimeZone,
 } from './lib/leaderboard';
+import { getFirstOpenSlot, getGridPlacement } from './src/track';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -16,8 +17,6 @@ import { WebSocketServer, WebSocket } from 'ws';
 dotenv.config({ path: '.env.local', quiet: true });
 dotenv.config({ quiet: true });
 
-const START_FINISH_X = 900;
-const STARTING_GRID_OFFSET = 140;
 const PORT = 3004;
 
 type Player = {
@@ -30,9 +29,12 @@ type Player = {
   vx: number;
   vy: number;
   color: string;
+  lights?: boolean;
 };
 
-const colors = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899', '#84cc16', '#14b8a6'];
+function queryTimeZone(value: unknown) {
+  return typeof value === 'string' ? value : undefined;
+}
 
 async function startServer() {
   if (process.env.DATABASE_URL) {
@@ -63,10 +65,7 @@ async function startServer() {
 
   app.get('/api/leaderboard', async (req, res) => {
     try {
-      const timeZone = sanitizeTimeZone(
-        typeof req.query.timeZone === 'string' ? req.query.timeZone : undefined,
-      );
-      const leaderboard = await getLeaderboardData(timeZone);
+      const leaderboard = await getLeaderboardData(queryTimeZone(req.query.timeZone));
       res.json({ leaderboard });
     } catch (error) {
       console.error('Unable to load leaderboard', error);
@@ -75,17 +74,14 @@ async function startServer() {
   });
 
   app.post('/api/leaderboard', async (req, res) => {
-    const initials = sanitizeInitials(req.body?.initials);
-    const timeMs = Math.round(Number(req.body?.timeMs));
-
-    if (!Number.isFinite(timeMs) || timeMs <= 0) {
-      res.status(400).json({ error: 'A valid lap time is required' });
+    const lap = parseLapSubmission(req.body);
+    if ('error' in lap) {
+      res.status(400).json({ error: lap.error });
       return;
     }
 
     try {
-      const timeZone = sanitizeTimeZone(req.body?.timeZone);
-      const leaderboard = await recordLapTime(initials, timeMs, timeZone);
+      const leaderboard = await recordLapTime(lap.initials, lap.timeMs, lap.timeZone);
       sendLeaderboardToClients?.();
       res.status(201).json({ leaderboard });
     } catch (error) {
@@ -96,10 +92,7 @@ async function startServer() {
 
   app.delete('/api/leaderboard', async (req, res) => {
     try {
-      const timeZone = sanitizeTimeZone(
-        typeof req.query.timeZone === 'string' ? req.query.timeZone : undefined,
-      );
-      const leaderboard = await resetLeaderboardData(timeZone);
+      const leaderboard = await resetLeaderboardData(queryTimeZone(req.query.timeZone));
       sendLeaderboardToClients?.();
       res.json({ leaderboard });
     } catch (error) {
@@ -129,48 +122,39 @@ async function startServer() {
 
   const wss = new WebSocketServer({ server });
   const players = new Map<string, Player>();
-  sendLeaderboardToClients = () => {
-    const leaderboardMsg = JSON.stringify({ type: 'leaderboard' });
+
+  const broadcast = (message: object, except?: WebSocket) => {
+    const payload = JSON.stringify(message);
     wss.clients.forEach((client) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(leaderboardMsg);
+      if (client !== except && client.readyState === WebSocket.OPEN) {
+        client.send(payload);
       }
     });
   };
+  sendLeaderboardToClients = () => broadcast({ type: 'leaderboard' });
 
   wss.on('connection', (ws, req) => {
     const id = Math.random().toString(36).substring(2, 9);
     const requestUrl = new URL(req.url ?? '/', 'http://localhost');
     const initials = sanitizeInitials(requestUrl.searchParams.get('initials'));
 
-    const usedSlots = new Set(Array.from(players.values()).map((player) => player.slotIndex));
-    let slotIndex = 0;
-    while (usedSlots.has(slotIndex)) {
-      slotIndex++;
-    }
-
-    const color = colors[slotIndex % colors.length];
-    const startX = START_FINISH_X - STARTING_GRID_OFFSET - Math.floor(slotIndex / 2) * 120;
-    const startY = (slotIndex % 2 === 0) ? -80 : 80;
-
-    players.set(id, { id, slotIndex, initials, x: startX, y: startY, angle: 0, vx: 0, vy: 0, color });
+    const { slotIndex, color, x, y } = getGridPlacement(
+      getFirstOpenSlot(Array.from(players.values(), (player) => player.slotIndex)),
+    );
+    const player: Player = { id, slotIndex, initials, x, y, angle: 0, vx: 0, vy: 0, color };
+    players.set(id, player);
 
     ws.send(JSON.stringify({
       type: 'init',
       id,
       color,
       initials,
-      x: startX,
-      y: startY,
+      x,
+      y,
       players: Array.from(players.values()),
     }));
 
-    const joinMsg = JSON.stringify({ type: 'join', player: players.get(id) });
-    wss.clients.forEach((client) => {
-      if (client !== ws && client.readyState === WebSocket.OPEN) {
-        client.send(joinMsg);
-      }
-    });
+    broadcast({ type: 'join', player }, ws);
 
     ws.on('message', (data) => {
       try {
@@ -188,18 +172,14 @@ async function startServer() {
           return;
         }
 
-        const player = players.get(id);
-        if (!player) {
-          return;
-        }
-
         player.x = msg.x ?? player.x;
         player.y = msg.y ?? player.y;
         player.angle = msg.angle ?? player.angle;
         player.vx = msg.vx ?? player.vx;
         player.vy = msg.vy ?? player.vy;
+        player.lights = msg.lights ?? player.lights;
 
-        const updateMsg = JSON.stringify({
+        broadcast({
           type: 'update',
           id,
           x: player.x,
@@ -207,14 +187,8 @@ async function startServer() {
           angle: player.angle,
           vx: player.vx,
           vy: player.vy,
-          lights: msg.lights,
-        });
-
-        wss.clients.forEach((client) => {
-          if (client !== ws && client.readyState === WebSocket.OPEN) {
-            client.send(updateMsg);
-          }
-        });
+          lights: player.lights,
+        }, ws);
       } catch (error) {
         console.error('Message error', error);
       }
@@ -222,12 +196,7 @@ async function startServer() {
 
     ws.on('close', () => {
       players.delete(id);
-      const leaveMsg = JSON.stringify({ type: 'leave', id });
-      wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(leaveMsg);
-        }
-      });
+      broadcast({ type: 'leave', id });
     });
   });
 }

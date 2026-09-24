@@ -1,16 +1,26 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   getMissingSupabaseRealtimeEnvVars,
   getSupabaseClient,
   hasSupabaseRealtimeConfig,
 } from './lib/supabase';
 import {
+  emptyLeaderboardData,
+  LEADERBOARD_LIMIT,
+  normalizeInitials,
+  type LeaderboardData,
+  type LeaderboardEntry,
+} from '../lib/leaderboardShared';
+import {
+  getFirstOpenSlot,
+  getGridPlacement,
+  getGridSlotPosition,
   HALF_TRACK_WIDTH,
   START_FINISH_LINE_WIDTH,
   START_FINISH_X,
   START_FINISH_Y,
-  STARTING_GRID_OFFSET,
   TRACK_WIDTH,
+  traceTrack,
   trackPoints,
 } from './track';
 import SpeedGauge from './SpeedGauge';
@@ -22,13 +32,16 @@ import {
   drawMinimap,
   drawSkidMarksV2,
   drawTrackV2,
-  drawVignette,
+  drawGrass,
+  drawSmoke,
   getViewportZoomScale,
+  HEADLIGHT_REACH,
+  prepareHeadlights,
   MINIMAP_ASPECT,
   spawnGrass,
   spawnSmoke,
-  updateAndDrawGrass,
-  updateAndDrawSmoke,
+  updateGrass,
+  updateSmoke,
   V2_TOP_SPEED,
   V2_ZOOM,
   V2_ZOOM_AT_SPEED,
@@ -56,9 +69,7 @@ const checkpoints = [
   {x: -1000, y: 1000}
 ];
 
-const DEFAULT_START_X = START_FINISH_X - STARTING_GRID_OFFSET;
-const DEFAULT_START_Y = -80;
-const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899', '#84cc16', '#14b8a6'];
+const DEFAULT_START = getGridSlotPosition(0);
 
 type RemotePlayer = {
   id: string;
@@ -82,16 +93,6 @@ type MultiplayerConnection = {
   close: () => void;
   sendUpdate: (update: CarUpdate) => void;
   broadcastLeaderboard: () => void;
-};
-
-type LeaderboardEntry = {
-  initials: string;
-  timeMs: number;
-};
-
-type LeaderboardData = {
-  allTime: LeaderboardEntry[];
-  today: LeaderboardEntry[];
 };
 
 type ConfettiParticle = {
@@ -118,8 +119,11 @@ type ExplosionParticle = {
 };
 
 const MOBILE_HUD_BREAKPOINT = 768;
-const LEADERBOARD_DISPLAY_COUNT = 5;
-const PODIUM_EMOJIS = ['🥇', '🥈', '🥉'] as const;
+const PODIUM = [
+  { emoji: '🥇', label: 'gold' },
+  { emoji: '🥈', label: 'silver' },
+  { emoji: '🥉', label: 'bronze' },
+] as const;
 const CONFETTI_COLORS = ['#f43f5e', '#f59e0b', '#fde047', '#22c55e', '#38bdf8', '#a78bfa'];
 const PODIUM_CONFETTI_COLORS = [
   ['#facc15', '#fde047', '#fef3c7', '#f59e0b'],
@@ -129,6 +133,7 @@ const PODIUM_CONFETTI_COLORS = [
 const EXPLOSION_COLORS = ['#ffffff', '#fde047', '#fb7185', '#f97316', '#ef4444'] as const;
 const EASTER_EGG_INITIALS = 'SLY';
 const GRAPHICS_MODE_STORAGE_KEY = 'apex-racer:graphics';
+const HUD_UPDATE_INTERVAL_MS = 33;
 
 function loadGraphicsMode(): GraphicsMode {
   try {
@@ -305,30 +310,10 @@ function drawDriverTag(ctx: CanvasRenderingContext2D, x: number, y: number, init
   ctx.restore();
 }
 
-function sanitizeInitials(value: string) {
-  return value.toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3);
-}
-
-function getGridPlacement(slotIndex: number) {
-  return {
-    slotIndex,
-    color: PLAYER_COLORS[slotIndex % PLAYER_COLORS.length],
-    x: START_FINISH_X - STARTING_GRID_OFFSET - Math.floor(slotIndex / 2) * 120,
-    y: slotIndex % 2 === 0 ? -80 : 80,
-  };
-}
-
-function getEmptyLeaderboardData(): LeaderboardData {
-  return {
-    allTime: [],
-    today: [],
-  };
-}
-
 function getLeaderboardPlacement(
   timeMs: number,
   entries: LeaderboardEntry[],
-  placementLimit = LEADERBOARD_DISPLAY_COUNT,
+  placementLimit = LEADERBOARD_LIMIT,
 ) {
   if (!Number.isFinite(timeMs) || timeMs <= 0) {
     return null;
@@ -349,7 +334,7 @@ function getLeaderboardPlacement(
 function getBestLeaderboardPlacement(
   timeMs: number,
   leaderboard: LeaderboardData,
-  placementLimit = LEADERBOARD_DISPLAY_COUNT,
+  placementLimit = LEADERBOARD_LIMIT,
 ) {
   const placements = [
     getLeaderboardPlacement(timeMs, leaderboard.allTime, placementLimit),
@@ -363,8 +348,15 @@ function getBestLeaderboardPlacement(
   return Math.min(...placements);
 }
 
-function getPlacementMedal(placement: number | null) {
-  return placement === null ? null : PODIUM_EMOJIS[placement] ?? null;
+function formatTime(ms: number | null | undefined) {
+  if (ms == null) {
+    return '--:--.--';
+  }
+  const totalSeconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  const hundredths = Math.floor((ms % 1000) / 10);
+  return `${minutes}:${seconds.toString().padStart(2, '0')}.${hundredths.toString().padStart(2, '0')}`;
 }
 
 function createConfettiBurst(
@@ -413,17 +405,6 @@ function createExplosionBurst(x: number, y: number, accentColor: string): Explos
   });
 }
 
-function getFirstOpenSlot(players: PresencePlayer[]) {
-  const occupiedSlots = new Set(players.map((player) => player.slotIndex));
-  let slotIndex = 0;
-
-  while (occupiedSlots.has(slotIndex)) {
-    slotIndex++;
-  }
-
-  return slotIndex;
-}
-
 function flattenPresencePlayers(presenceState: Record<string, PresencePlayer[]>) {
   return Object.values(presenceState).flat();
 }
@@ -432,59 +413,45 @@ function getClientTimeZone() {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 }
 
-function normalizeLeaderboardResponse(data: { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] } | null | undefined) {
-  if (data?.leaderboard) {
-    return data.leaderboard;
-  }
-
-  if (data?.entries) {
-    return {
-      allTime: data.entries,
-      today: data.entries,
-    } satisfies LeaderboardData;
-  }
-
-  return getEmptyLeaderboardData();
-}
-
-async function fetchLeaderboard(timeZone: string) {
-  const response = await fetch(`/api/leaderboard?timeZone=${encodeURIComponent(timeZone)}`);
+async function requestLeaderboard(errorMessage: string, init?: RequestInit, timeZone?: string) {
+  const query = timeZone ? `?timeZone=${encodeURIComponent(timeZone)}` : '';
+  const response = await fetch(`/api/leaderboard${query}`, init);
   if (!response.ok) {
-    throw new Error('Unable to load leaderboard');
+    throw new Error(errorMessage);
   }
 
-  const data = await response.json() as { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] };
-  return normalizeLeaderboardResponse(data);
+  const data = await response.json() as { leaderboard?: LeaderboardData };
+  return data.leaderboard ?? emptyLeaderboardData();
 }
 
-async function submitLapTime(initials: string, timeMs: number, timeZone: string) {
-  const response = await fetch('/api/leaderboard', {
+const fetchLeaderboard = (timeZone: string) => requestLeaderboard('Unable to load leaderboard', undefined, timeZone);
+
+const submitLapTime = (initials: string, timeMs: number, timeZone: string) =>
+  requestLeaderboard('Unable to save lap time', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ initials, timeMs, timeZone }),
   });
 
-  if (!response.ok) {
-    throw new Error('Unable to save lap time');
-  }
+const resetLeaderboard = (timeZone: string) =>
+  requestLeaderboard('Unable to reset leaderboard', { method: 'DELETE' }, timeZone);
 
-  const data = await response.json() as { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] };
-  return normalizeLeaderboardResponse(data);
+/** Applies a car update from the network onto the stored remote player. */
+function applyCarUpdate(player: RemotePlayer, update: CarUpdate) {
+  player.x = update.x;
+  player.y = update.y;
+  player.angle = update.angle;
+  player.vx = update.vx;
+  player.vy = update.vy;
+  player.lights = update.lights;
 }
 
-async function resetLeaderboard(timeZone: string) {
-  const response = await fetch(`/api/leaderboard?timeZone=${encodeURIComponent(timeZone)}`, {
-    method: 'DELETE',
-  });
+function remoteLightStrength(player: RemotePlayer) {
+  return player.lights === false ? 0 : 0.5;
+}
 
-  if (!response.ok) {
-    throw new Error('Unable to reset leaderboard');
-  }
-
-  const data = await response.json() as { leaderboard?: LeaderboardData; entries?: LeaderboardEntry[] };
-  return normalizeLeaderboardResponse(data);
+function isMobileViewport() {
+  return window.matchMedia(`(max-width: ${MOBILE_HUD_BREAKPOINT - 1}px)`).matches;
 }
 
 export default function App() {
@@ -494,16 +461,12 @@ export default function App() {
   const [lapTime, setLapTime] = useState(0);
   const [lastLap, setLastLap] = useState<number | null>(null);
   const [bestLap, setBestLap] = useState<number | null>(null);
-  const [leaderboard, setLeaderboard] = useState<LeaderboardData>(() => getEmptyLeaderboardData());
-  const [leaderboardStatus, setLeaderboardStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [leaderboard, setLeaderboard] = useState<LeaderboardData>(() => emptyLeaderboardData());
+  const [leaderboardStatus, setLeaderboardStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [playerInitials, setPlayerInitials] = useState('');
   const [initialsInput, setInitialsInput] = useState('');
-  const [isMobileHud, setIsMobileHud] = useState(
-    () => typeof window !== 'undefined' && window.innerWidth < MOBILE_HUD_BREAKPOINT,
-  );
-  const [isHudOpen, setIsHudOpen] = useState(
-    () => !(typeof window !== 'undefined' && window.innerWidth < MOBILE_HUD_BREAKPOINT),
-  );
+  const [isMobileHud, setIsMobileHud] = useState(isMobileViewport);
+  const [isHudOpen, setIsHudOpen] = useState(() => !isMobileViewport());
   const [lapReadyToFinish, setLapReadyToFinish] = useState(false);
   const [lapCelebrationMessage, setLapCelebrationMessage] = useState<string | null>(null);
   const [isResettingLeaderboard, setIsResettingLeaderboard] = useState(false);
@@ -521,20 +484,19 @@ export default function App() {
   const myColorRef = useRef<string>('#06b6d4');
   const remotePlayers = useRef<Map<string, RemotePlayer>>(new Map());
   const lastSendTime = useRef<number>(0);
-  const leaderboardRef = useRef<LeaderboardData>(getEmptyLeaderboardData());
+  const leaderboardRef = useRef<LeaderboardData>(emptyLeaderboardData());
   const confettiParticles = useRef<ConfettiParticle[]>([]);
   const explosionParticles = useRef<ExplosionParticle[]>([]);
   const isDestroyedRef = useRef(false);
-  const lapReadyToFinishRef = useRef(false);
 
   const keys = useRef<{ [key: string]: boolean }>({});
   const car = useRef({
-    x: DEFAULT_START_X, y: DEFAULT_START_Y,
+    x: DEFAULT_START.x, y: DEFAULT_START.y,
     vx: 0, vy: 0,
     angle: 0,
   });
   const skidMarks = useRef<SkidMark[]>([]);
-  const skidStreak = useRef({ id: 0, active: false, onGrass: false });
+  const skidStreak = useRef<{ id: number; surface: 'road' | 'grass' | null }>({ id: 0, surface: null });
   const smokeParticles = useRef<SmokeParticle[]>([]);
   const grassParticles = useRef<GrassParticle[]>([]);
   const gameState = useRef({
@@ -545,15 +507,9 @@ export default function App() {
   useEffect(() => {
     const mediaQuery = window.matchMedia(`(max-width: ${MOBILE_HUD_BREAKPOINT - 1}px)`);
 
-    const syncHudMode = (mobile: boolean) => {
-      setIsMobileHud(mobile);
-      setIsHudOpen(!mobile);
-    };
-
-    syncHudMode(mediaQuery.matches);
-
     const handleChange = (event: MediaQueryListEvent) => {
-      syncHudMode(event.matches);
+      setIsMobileHud(event.matches);
+      setIsHudOpen(!event.matches);
     };
 
     mediaQuery.addEventListener('change', handleChange);
@@ -593,34 +549,34 @@ export default function App() {
     } catch {
       // Private mode or blocked storage: the choice just won't persist
     }
+    if (graphicsMode === 'v2') {
+      // Build the headlight sprite now, not in the middle of the first lit frame
+      const timeoutId = window.setTimeout(prepareHeadlights, 0);
+      return () => window.clearTimeout(timeoutId);
+    }
   }, [graphicsMode]);
 
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadInitialLeaderboard = async () => {
-      try {
-        setLeaderboardStatus('loading');
-        const nextLeaderboard = await fetchLeaderboard(clientTimeZone.current);
-        if (!cancelled) {
-          leaderboardRef.current = nextLeaderboard;
-          setLeaderboard(nextLeaderboard);
-          setLeaderboardStatus('ready');
-        }
-      } catch (error) {
-        console.error(error);
-        if (!cancelled) {
-          setLeaderboardStatus('error');
-        }
-      }
-    };
-
-    void loadInitialLeaderboard();
-
-    return () => {
-      cancelled = true;
-    };
+  // Runs a leaderboard request and shows its result (or the error state)
+  const updateLeaderboard = useCallback(async (request: () => Promise<LeaderboardData>) => {
+    try {
+      setLeaderboard(await request());
+      setLeaderboardStatus('ready');
+      return true;
+    } catch (error) {
+      console.error(error);
+      setLeaderboardStatus('error');
+      return false;
+    }
   }, []);
+
+  const loadLeaderboard = useCallback(() => {
+    setLeaderboardStatus('loading');
+    return updateLeaderboard(() => fetchLeaderboard(clientTimeZone.current));
+  }, [updateLeaderboard]);
+
+  useEffect(() => {
+    void loadLeaderboard();
+  }, [loadLeaderboard]);
 
   useEffect(() => {
     if (!playerInitials) {
@@ -629,44 +585,15 @@ export default function App() {
 
     let cancelled = false;
 
-    const loadLeaderboard = async () => {
-      try {
-        setLeaderboardStatus('loading');
-        const nextLeaderboard = await fetchLeaderboard(clientTimeZone.current);
-        if (!cancelled) {
-          leaderboardRef.current = nextLeaderboard;
-          setLeaderboard(nextLeaderboard);
-          setLeaderboardStatus('ready');
-        }
-      } catch (error) {
-        console.error(error);
-        if (!cancelled) {
-          setLeaderboardStatus('error');
-        }
-      }
-    };
-
     const saveLapTime = async (timeMs: number) => {
-      try {
-        const nextLeaderboard = await submitLapTime(playerInitials, timeMs, clientTimeZone.current);
-        if (!cancelled) {
-          leaderboardRef.current = nextLeaderboard;
-          setLeaderboard(nextLeaderboard);
-          setLeaderboardStatus('ready');
-          multiplayerRef.current?.broadcastLeaderboard();
-        }
-      } catch (error) {
-        console.error(error);
-        if (!cancelled) {
-          setLeaderboardStatus('error');
-        }
+      const saved = await updateLeaderboard(() => submitLapTime(playerInitials, timeMs, clientTimeZone.current));
+      if (saved && !cancelled) {
+        multiplayerRef.current?.broadcastLeaderboard();
       }
     };
 
-    void loadLeaderboard();
-
-    car.current.x = DEFAULT_START_X;
-    car.current.y = DEFAULT_START_Y;
+    car.current.x = DEFAULT_START.x;
+    car.current.y = DEFAULT_START.y;
     car.current.vx = 0;
     car.current.vy = 0;
     car.current.angle = 0;
@@ -676,11 +603,10 @@ export default function App() {
     confettiParticles.current = [];
     explosionParticles.current = [];
     isDestroyedRef.current = false;
-    lapReadyToFinishRef.current = false;
     setLastLap(null);
     setLapReadyToFinish(false);
     setLapCelebrationMessage(null);
-    const shouldUseRealtimeServer = !window.location.hostname.endsWith('.vercel.app');
+    const isVercelHost = window.location.hostname.endsWith('.vercel.app');
     multiplayerRef.current = null;
 
     const syncRemotePlayersFromPresence = (players: PresencePlayer[]) => {
@@ -730,12 +656,7 @@ export default function App() {
           } else if (msg.type === 'update') {
             const p = remotePlayers.current.get(msg.id);
             if (p) {
-              p.x = msg.x;
-              p.y = msg.y;
-              p.angle = msg.angle;
-              p.vx = msg.vx;
-              p.vy = msg.vy;
-              p.lights = msg.lights;
+              applyCarUpdate(p, msg);
             }
           } else if (msg.type === 'leaderboard') {
             void loadLeaderboard();
@@ -783,26 +704,12 @@ export default function App() {
 
         const existingPlayer = remotePlayers.current.get(payload.id);
         if (existingPlayer) {
-          existingPlayer.x = payload.x;
-          existingPlayer.y = payload.y;
-          existingPlayer.angle = payload.angle;
-          existingPlayer.vx = payload.vx;
-          existingPlayer.vy = payload.vy;
-          existingPlayer.lights = payload.lights;
+          applyCarUpdate(existingPlayer, payload);
           return;
         }
 
-        remotePlayers.current.set(payload.id, {
-          id: payload.id,
-          initials: '???',
-          color: '#94a3b8',
-          x: payload.x,
-          y: payload.y,
-          angle: payload.angle,
-          vx: payload.vx,
-          vy: payload.vy,
-          lights: payload.lights,
-        });
+        // An update can arrive before presence tells us who this is
+        remotePlayers.current.set(payload.id, { ...payload, initials: '???', color: '#94a3b8' });
       });
 
       channel.on('broadcast', { event: 'leaderboard' }, () => {
@@ -811,22 +718,17 @@ export default function App() {
         }
       });
 
-      const resyncPresence = () => {
-        const players = flattenPresencePlayers(channel.presenceState<PresencePlayer>());
-        syncRemotePlayersFromPresence(players);
-      };
-
-      channel
-        .on('presence', { event: 'sync' }, resyncPresence)
-        .on('presence', { event: 'join' }, resyncPresence)
-        .on('presence', { event: 'leave' }, resyncPresence);
+      // Joins and leaves are always followed by a sync, which carries the full state
+      channel.on('presence', { event: 'sync' }, () => {
+        syncRemotePlayersFromPresence(flattenPresencePlayers(channel.presenceState<PresencePlayer>()));
+      });
 
       await new Promise<void>((resolve, reject) => {
         channel.subscribe(async (status, error) => {
           if (status === 'SUBSCRIBED') {
             try {
               const existingPlayers = flattenPresencePlayers(channel.presenceState<PresencePlayer>());
-              const slotIndex = getFirstOpenSlot(existingPlayers);
+              const slotIndex = getFirstOpenSlot(existingPlayers.map((player) => player.slotIndex));
               const placement = getGridPlacement(slotIndex);
 
               myIdRef.current = playerId;
@@ -897,13 +799,13 @@ export default function App() {
         } catch (error) {
           console.error('Unable to connect to Supabase Realtime', error);
         }
-      } else if (window.location.hostname.endsWith('.vercel.app')) {
+      } else if (isVercelHost) {
         console.warn(
           `Supabase Realtime is not configured. Missing env vars: ${getMissingSupabaseRealtimeEnvVars().join(', ')}`,
         );
       }
 
-      if (shouldUseRealtimeServer) {
+      if (!isVercelHost) {
         multiplayerRef.current = setupLocalWebSocketConnection();
       }
     };
@@ -946,8 +848,9 @@ export default function App() {
       viewHeight = canvas.clientHeight || window.innerHeight;
       canvas.width = Math.round(viewWidth * pixelRatio);
       canvas.height = Math.round(viewHeight * pixelRatio);
-      lightCanvas.width = canvas.width;
-      lightCanvas.height = canvas.height;
+      // Light is soft, so a 1x buffer looks the same and costs a quarter of 2x
+      lightCanvas.width = Math.round(viewWidth);
+      lightCanvas.height = Math.round(viewHeight);
     };
     window.addEventListener('resize', resize);
     // Also catches iOS toolbars collapsing, which does not always fire resize
@@ -960,6 +863,7 @@ export default function App() {
     let cameraX = viewWidth / 2;
     let cameraY = viewHeight / 2;
     let zoom = 1;
+    let lastHudUpdate = 0;
 
     const loop = (time: number) => {
       const c = car.current;
@@ -1033,62 +937,41 @@ export default function App() {
       c.x += c.vx;
       c.y += c.vy;
 
-      // Skid marks (and, in V2, ruts and flying clippings on the grass)
-      const isV2Graphics = graphicsModeRef.current === 'v2';
+      // Tyre effects are always simulated; each renderer picks what to draw
       const groundSpeed = Math.hypot(c.vx, c.vy);
       const isSkidding = Math.abs(lateralSpeed) > (isDrifting ? 1.5 : 3) && isOnTrack;
-      const isRutting = isV2Graphics && !isOnTrack && groundSpeed > 2;
-      if (isSkidding || isRutting) {
-        if (!skidStreak.current.active || skidStreak.current.onGrass !== isRutting) {
+      const isRutting = !isOnTrack && groundSpeed > 2;
+      const rearWheels = [-11, 11].map(side => ({
+        x: c.x + rightX * side - forwardX * 16,
+        y: c.y + rightY * side - forwardY * 16,
+      }));
+      const markSurface = isRutting ? 'grass' : isSkidding ? 'road' : null;
+      if (markSurface) {
+        if (markSurface !== skidStreak.current.surface) {
           skidStreak.current.id++;
         }
-        const streak = skidStreak.current.id;
-        const surface = isRutting ? 'grass' as const : undefined;
-        skidMarks.current.push({
-          x: c.x + rightX * -11 - forwardX * 16,
-          y: c.y + rightY * -11 - forwardY * 16,
-          life: 1.0,
-          side: 0,
-          streak,
-          surface,
-        });
-        skidMarks.current.push({
-          x: c.x + rightX * 11 - forwardX * 16,
-          y: c.y + rightY * 11 - forwardY * 16,
-          life: 1.0,
-          side: 1,
-          streak,
-          surface,
+        rearWheels.forEach((wheel, side) => {
+          skidMarks.current.push({
+            ...wheel,
+            life: 1.0,
+            side: side as 0 | 1,
+            streak: skidStreak.current.id,
+            surface: isRutting ? 'grass' : undefined,
+          });
         });
       }
+      skidStreak.current.surface = markSurface;
       if (isRutting) {
-        for (const side of [-11, 11]) {
-          spawnGrass(
-            grassParticles.current,
-            c.x + rightX * side - forwardX * 18,
-            c.y + rightY * side - forwardY * 18,
-            c.vx,
-            c.vy,
-            forwardX,
-            forwardY,
-            groundSpeed,
-          );
+        for (const wheel of rearWheels) {
+          spawnGrass(grassParticles.current, wheel.x, wheel.y, c.vx, c.vy, forwardX, forwardY, groundSpeed);
         }
       }
-      if (isSkidding) {
-        if (isV2Graphics && Math.random() < 0.7) {
-          const side = Math.random() < 0.5 ? -11 : 11;
-          spawnSmoke(
-            smokeParticles.current,
-            c.x + rightX * side - forwardX * 18,
-            c.y + rightY * side - forwardY * 18,
-            c.vx,
-            c.vy,
-          );
-        }
+      if (isSkidding && Math.random() < 0.7) {
+        const wheel = rearWheels[Math.random() < 0.5 ? 0 : 1];
+        spawnSmoke(smokeParticles.current, wheel.x, wheel.y, c.vx, c.vy);
       }
-      skidStreak.current.active = isSkidding || isRutting;
-      skidStreak.current.onGrass = isRutting;
+      updateSmoke(smokeParticles.current);
+      updateGrass(grassParticles.current);
 
       for (let i = skidMarks.current.length - 1; i >= 0; i--) {
         skidMarks.current[i].life -= 0.02;
@@ -1166,18 +1049,17 @@ export default function App() {
         }
       }
 
-      const nextLapReadyToFinish = state.nextCheckpoint >= checkpoints.length;
-      if (lapReadyToFinishRef.current !== nextLapReadyToFinish) {
-        lapReadyToFinishRef.current = nextLapReadyToFinish;
-        setLapReadyToFinish(nextLapReadyToFinish);
-      }
-
-      // Update UI
-      if (isDestroyed) {
-        setSpeedMph(0);
-      } else {
-        setSpeedMph(Math.abs(Math.round(speed * 3.1)));
-        setLapTime(Math.max(0, time - state.lapStartTime));
+      // Update the HUD at most ~30 times a second; re-rendering the whole
+      // component every frame costs more than the readout needs
+      if (time - lastHudUpdate >= HUD_UPDATE_INTERVAL_MS) {
+        lastHudUpdate = time;
+        setLapReadyToFinish(state.nextCheckpoint >= checkpoints.length);
+        if (isDestroyed) {
+          setSpeedMph(0);
+        } else {
+          setSpeedMph(Math.abs(Math.round(speed * 3.1)));
+          setLapTime(Math.max(0, time - state.lapStartTime));
+        }
       }
 
       // --- Camera ---
@@ -1218,13 +1100,13 @@ export default function App() {
       drawGrassV2(ctx, focusX - halfW, focusY - halfH, focusX + halfW, focusY + halfH);
       drawTrackV2(ctx);
       drawSkidMarksV2(ctx, skidMarks.current);
-      updateAndDrawSmoke(ctx, smokeParticles.current);
-      updateAndDrawGrass(ctx, grassParticles.current);
+      drawSmoke(ctx, smokeParticles.current);
+      drawGrass(ctx, grassParticles.current);
 
       const localLights = headlightsOnRef.current && !isDestroyed ? 1 : 0;
 
       remotePlayers.current.forEach(p => {
-        drawCarV2(ctx, p.x, p.y, p.angle, p.color, { lights: p.lights === false ? 0 : 0.5 });
+        drawCarV2(ctx, p.x, p.y, p.angle, p.color, { lights: remoteLightStrength(p) });
       });
 
       drawExplosion();
@@ -1235,31 +1117,31 @@ export default function App() {
       }
 
       // Headlights go on after the cars so they light up any bodywork they hit,
-      // with shadows cut out behind every car in a beam.
-      const localId = myIdRef.current ?? 'local';
-      const lightSources = [
+      // with shadows cut out behind every car in a beam. Cars whose beams
+      // cannot reach the screen are skipped, and so is the layer if none can.
+      const cars = [
         ...Array.from(remotePlayers.current.values(), (p: RemotePlayer) => ({
-          id: p.id, x: p.x, y: p.y, angle: p.angle, strength: p.lights === false ? 0 : 0.45,
+          id: p.id, x: p.x, y: p.y, angle: p.angle, strength: remoteLightStrength(p) * 0.9,
         })),
-        { id: localId, x: c.x, y: c.y, angle: c.angle, strength: localLights },
+        ...(isDestroyed ? [] : [{ id: myIdRef.current ?? 'local', x: c.x, y: c.y, angle: c.angle, strength: localLights }]),
       ];
-      if (lightCtx && lightSources.some(source => source.strength > 0)) {
+      const reachX = halfW + HEADLIGHT_REACH;
+      const reachY = halfH + HEADLIGHT_REACH;
+      const lightSources = cars.filter(car =>
+        car.strength > 0 && Math.abs(car.x - focusX) < reachX && Math.abs(car.y - focusY) < reachY,
+      );
+      if (lightCtx && lightSources.length > 0) {
+        const world = ctx.getTransform();
         lightCtx.setTransform(1, 0, 0, 1, 0, 0);
         lightCtx.clearRect(0, 0, lightCanvas.width, lightCanvas.height);
-        lightCtx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-        lightCtx.translate(viewWidth / 2, viewHeight / 2);
-        lightCtx.scale(zoom, zoom);
-        lightCtx.translate(-focusX, -focusY);
-        const occluders = [
-          ...Array.from(remotePlayers.current.values(), (p: RemotePlayer) => ({ id: p.id, x: p.x, y: p.y, angle: p.angle })),
-          ...(isDestroyed ? [] : [{ id: localId, x: c.x, y: c.y, angle: c.angle }]),
-        ];
-        drawLightLayerV2(lightCtx, lightSources, occluders);
+        // Same world transform as the scene, minus the device pixel ratio
+        lightCtx.setTransform(new DOMMatrix().scale(1 / pixelRatio).multiply(world));
+        drawLightLayerV2(lightCtx, lightSources, cars);
 
         ctx.save();
         ctx.setTransform(1, 0, 0, 1, 0, 0);
         ctx.globalCompositeOperation = 'screen';
-        ctx.drawImage(lightCanvas, 0, 0);
+        ctx.drawImage(lightCanvas, 0, 0, canvas.width, canvas.height);
         ctx.restore();
       }
 
@@ -1270,7 +1152,6 @@ export default function App() {
 
       ctx.restore();
 
-      drawVignette(ctx, viewWidth, viewHeight);
       drawConfetti();
 
       const minimap = minimapRef.current;
@@ -1278,7 +1159,7 @@ export default function App() {
         drawMinimap(
           minimap,
           { x: c.x, y: c.y, angle: c.angle, color: myColorRef.current },
-          Array.from(remotePlayers.current.values()),
+          remotePlayers.current.values(),
         );
       }
     };
@@ -1346,8 +1227,6 @@ export default function App() {
     const renderClassic = (isDestroyed: boolean) => {
       const c = car.current;
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      smokeParticles.current.length = 0;
-      grassParticles.current.length = 0;
 
       ctx.fillStyle = '#166534'; // Grass
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1376,21 +1255,13 @@ export default function App() {
       // Track
       ctx.lineJoin = 'round';
       ctx.lineCap = 'round';
-      ctx.beginPath();
-      ctx.moveTo(trackPoints[0].x, trackPoints[0].y);
-      for (let i = 1; i < trackPoints.length; i++) {
-        ctx.lineTo(trackPoints[i].x, trackPoints[i].y);
-      }
+      traceTrack(ctx);
       ctx.lineWidth = TRACK_WIDTH;
       ctx.strokeStyle = '#333';
       ctx.stroke();
 
       // Center line
-      ctx.beginPath();
-      ctx.moveTo(trackPoints[0].x, trackPoints[0].y);
-      for (let i = 1; i < trackPoints.length; i++) {
-        ctx.lineTo(trackPoints[i].x, trackPoints[i].y);
-      }
+      traceTrack(ctx);
       ctx.lineWidth = 8;
       ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
       ctx.setLineDash([40, 40]);
@@ -1457,17 +1328,9 @@ export default function App() {
     };
   }, [playerInitials]);
 
-  const formatTime = (ms: number) => {
-    const totalSeconds = Math.floor(ms / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    const hundredths = Math.floor((ms % 1000) / 10);
-    return `${minutes}:${seconds.toString().padStart(2, '0')}.${hundredths.toString().padStart(2, '0')}`;
-  };
-
   const handleJoin = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    const nextInitials = sanitizeInitials(initialsInput);
+    const nextInitials = normalizeInitials(initialsInput);
     if (nextInitials.length === 0) {
       return;
     }
@@ -1485,32 +1348,75 @@ export default function App() {
       return;
     }
 
-    try {
-      setIsResettingLeaderboard(true);
-      const nextLeaderboard = await resetLeaderboard(clientTimeZone.current);
-      leaderboardRef.current = nextLeaderboard;
-      setLeaderboard(nextLeaderboard);
-      setLeaderboardStatus('ready');
+    setIsResettingLeaderboard(true);
+    if (await updateLeaderboard(() => resetLeaderboard(clientTimeZone.current))) {
       setLapCelebrationMessage(null);
       multiplayerRef.current?.broadcastLeaderboard();
-    } catch (error) {
-      console.error(error);
-      setLeaderboardStatus('error');
-    } finally {
-      setIsResettingLeaderboard(false);
     }
+    setIsResettingLeaderboard(false);
   };
 
   const currentLapDisplay = formatTime(lapTime);
   const currentLapPlacement = playerInitials && lapReadyToFinish
-    ? getBestLeaderboardPlacement(lapTime, leaderboard, PODIUM_EMOJIS.length)
+    ? getBestLeaderboardPlacement(lapTime, leaderboard, PODIUM.length)
     : null;
-  const currentLapMedal = getPlacementMedal(currentLapPlacement);
-  const currentLapMedalLabel = currentLapPlacement === null
-    ? null
-    : ['gold', 'silver', 'bronze'][currentLapPlacement];
-  const leaderboardSlots = Array.from({ length: LEADERBOARD_DISPLAY_COUNT }, (_, index) => index);
-  const isLeaderboardLoading = leaderboardStatus === 'idle' || leaderboardStatus === 'loading';
+  const currentLapPodium = currentLapPlacement === null ? null : PODIUM[currentLapPlacement];
+  const currentLapMedalBadge = currentLapPodium && (
+    <span
+      aria-label={`Current lap is on ${currentLapPodium.label} pace`}
+      role="img"
+      title={`Current lap is on ${currentLapPodium.label} pace`}
+    >
+      {currentLapPodium.emoji}
+    </span>
+  );
+  const leaderboardSlots = Array.from({ length: LEADERBOARD_LIMIT }, (_, index) => index);
+  const isLeaderboardLoading = leaderboardStatus === 'loading';
+
+  const renderLeaderboardList = (entries: LeaderboardEntry[], keyPrefix: string) => (
+    <div className="space-y-2">
+      {isLeaderboardLoading ? (
+        <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-center text-[10px] font-semibold uppercase tracking-[0.28em] text-white/45 animate-pulse">
+          Loading top scores...
+        </div>
+      ) : (
+        leaderboardSlots.map((index) => {
+          const entry = entries[index];
+          return (
+            <div key={`${keyPrefix}-${index}`} className="flex items-center justify-between gap-4 text-sm sm:gap-6">
+              <span className="text-white/80">
+                {`#${index + 1} `}
+                <span className="font-bold">{entry?.initials ?? '---'}</span>
+              </span>
+              <span className={entry ? 'font-bold text-cyan-100' : 'text-white/30'}>
+                {formatTime(entry?.timeMs)}
+              </span>
+            </div>
+          );
+        })
+      )}
+    </div>
+  );
+
+  const renderLapRow = (label: string, ms: number | null, colorClass: string) => (
+    <div className="flex items-center justify-between gap-4 sm:gap-6">
+      <span className="text-xs uppercase tracking-widest text-gray-400">{label}</span>
+      <span className={`text-base font-bold sm:text-lg ${ms === null ? 'text-white/30' : colorClass}`}>
+        {formatTime(ms)}
+      </span>
+    </div>
+  );
+
+  // Press-and-hold handlers for an on-screen control that stands in for a key
+  const holdKey = (key: string) => {
+    const set = (down: boolean) => (event: React.PointerEvent) => {
+      event.preventDefault();
+      keys.current[key] = down;
+    };
+    return { onPointerDown: set(true), onPointerUp: set(false), onPointerLeave: set(false) };
+  };
+  const controlButtonClass = 'bg-black/50 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-white/30 select-none touch-none';
+
   const hudToggleButton = (
     <button
       aria-expanded={isHudOpen}
@@ -1543,15 +1449,7 @@ export default function App() {
         </div>
         <div className="mt-1 flex items-center gap-2 font-mono">
           <span className="text-lg font-bold text-yellow-400">{currentLapDisplay}</span>
-          {currentLapMedal && currentLapMedalLabel && (
-            <span
-              aria-label={`Current lap is on ${currentLapMedalLabel} pace`}
-              role="img"
-              title={`Current lap is on ${currentLapMedalLabel} pace`}
-            >
-              {currentLapMedal}
-            </span>
-          )}
+          {currentLapMedalBadge}
         </div>
       </div>
     </div>
@@ -1563,7 +1461,7 @@ export default function App() {
       <span id="graphics-mode-label" className="text-xs uppercase tracking-widest text-gray-400">Graphics</span>
       <div
         aria-labelledby="graphics-mode-label"
-        className="pointer-events-auto relative grid w-40 grid-cols-2 rounded-full border border-white/10 bg-white/5 p-1"
+        className="pointer-events-auto relative grid w-28 grid-cols-2 rounded-full border border-white/10 bg-white/5 p-1"
         role="radiogroup"
       >
         <span
@@ -1582,7 +1480,7 @@ export default function App() {
             role="radio"
             type="button"
           >
-            {mode === 'classic' ? 'Classic' : 'V2'}
+            {mode === 'classic' ? 'V1' : 'V2'}
           </button>
         ))}
       </div>
@@ -1606,57 +1504,18 @@ export default function App() {
           <span className="text-xs uppercase tracking-widest text-gray-400">Time</span>
           <div className="flex items-center gap-2">
             <span className="text-lg font-bold text-yellow-400 sm:text-xl">{currentLapDisplay}</span>
-            {currentLapMedal && currentLapMedalLabel && (
-              <span
-                aria-label={`Current lap is on ${currentLapMedalLabel} pace`}
-                role="img"
-                title={`Current lap is on ${currentLapMedalLabel} pace`}
-              >
-                {currentLapMedal}
-              </span>
-            )}
+            {currentLapMedalBadge}
           </div>
         </div>
-        <div className="flex items-center justify-between gap-4 sm:gap-6">
-          <span className="text-xs uppercase tracking-widest text-gray-400">Last lap</span>
-          <span className={lastLap === null ? 'text-base font-bold text-white/30 sm:text-lg' : 'text-base font-bold text-cyan-100 sm:text-lg'}>
-            {lastLap === null ? '--:--.--' : formatTime(lastLap)}
-          </span>
-        </div>
-        <div className="flex items-center justify-between gap-4 sm:gap-6">
-          <span className="text-xs uppercase tracking-widest text-gray-400">Best lap</span>
-          <span className={bestLap === null ? 'text-base font-bold text-white/30 sm:text-lg' : 'text-base font-bold text-green-400 sm:text-lg'}>
-            {bestLap === null ? '--:--.--' : formatTime(bestLap)}
-          </span>
-        </div>
+        {renderLapRow('Last lap', lastLap, 'text-cyan-100')}
+        {renderLapRow('Best lap', bestLap, 'text-green-400')}
         <div className="mt-3 border-t border-white/10 pt-3">
-          <div className="mb-2 text-xs uppercase tracking-widest text-gray-400">Top 5 All Time</div>
-          <div className="space-y-2">
-            {isLeaderboardLoading ? (
-              <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-center text-[10px] font-semibold uppercase tracking-[0.28em] text-white/45 animate-pulse">
-                Loading top scores...
-              </div>
-            ) : (
-              leaderboardSlots.map((index) => {
-                const entry = leaderboard.allTime[index];
-                return (
-                  <div key={`all-time-${index}`} className="flex items-center justify-between gap-4 text-sm sm:gap-6">
-                    <span className="text-white/80">
-                      {`#${index + 1} `}
-                      <span className="font-bold">{entry?.initials ?? '---'}</span>
-                    </span>
-                    <span className={entry ? 'font-bold text-cyan-100' : 'text-white/30'}>
-                      {entry ? formatTime(entry.timeMs) : '--:--.--'}
-                    </span>
-                  </div>
-                );
-              })
-            )}
-          </div>
+          <div className="mb-2 text-xs uppercase tracking-widest text-gray-400">Top {LEADERBOARD_LIMIT} All Time</div>
+          {renderLeaderboardList(leaderboard.allTime, 'all-time')}
         </div>
         <div className="mt-4 border-t border-white/10 pt-3">
           <div className="mb-2 flex items-center justify-between gap-3">
-            <span className="text-xs uppercase tracking-widest text-gray-400">Top 5 Today</span>
+            <span className="text-xs uppercase tracking-widest text-gray-400">Top {LEADERBOARD_LIMIT} Today</span>
             <button
               className="pointer-events-auto rounded-full border border-rose-400/25 bg-rose-500/10 px-3 py-1 text-[10px] font-bold uppercase tracking-[0.25em] text-rose-200 transition hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
               disabled={isResettingLeaderboard || isLeaderboardLoading}
@@ -1668,28 +1527,7 @@ export default function App() {
               {isResettingLeaderboard ? 'Resetting' : 'Reset'}
             </button>
           </div>
-          <div className="space-y-2">
-            {isLeaderboardLoading ? (
-              <div className="rounded-2xl border border-white/10 bg-white/[0.03] px-3 py-3 text-center text-[10px] font-semibold uppercase tracking-[0.28em] text-white/45 animate-pulse">
-                Loading top scores...
-              </div>
-            ) : (
-              leaderboardSlots.map((index) => {
-                const entry = leaderboard.today[index];
-                return (
-                  <div key={`today-${index}`} className="flex items-center justify-between gap-4 text-sm sm:gap-6">
-                    <span className="text-white/80">
-                      {`#${index + 1} `}
-                      <span className="font-bold">{entry?.initials ?? '---'}</span>
-                    </span>
-                    <span className={entry ? 'font-bold text-cyan-100' : 'text-white/30'}>
-                      {entry ? formatTime(entry.timeMs) : '--:--.--'}
-                    </span>
-                  </div>
-                );
-              })
-            )}
-          </div>
+          {renderLeaderboardList(leaderboard.today, 'today')}
           {leaderboardStatus === 'error' && (
             <p className="mt-2 text-xs text-rose-300">Leaderboard unavailable</p>
           )}
@@ -1702,28 +1540,30 @@ export default function App() {
     <div className="fixed inset-0 overflow-hidden bg-green-900 font-sans">
       <canvas ref={canvasRef} className="block h-full w-full touch-none" />
       
-      {/* HUD */}
-      <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] left-[max(1rem,env(safe-area-inset-left))] z-20 flex flex-col gap-3 sm:top-6 sm:left-6">
-        {isMobileHud ? (
-          <>
-            {compactHud}
+      {isV2 && (
+        // Vignette as CSS so it is composited once instead of painted every frame
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-0"
+          style={{ background: 'radial-gradient(circle farthest-corner, rgba(2, 6, 23, 0) 45%, rgba(2, 6, 23, 0.4) 100%)' }}
+        />
+      )}
 
-            {isHudOpen && (
-              <div className="pointer-events-auto max-h-[min(70vh,28rem)] w-[min(18rem,calc(100vw-2rem))] overflow-y-auto rounded-3xl border border-white/10 bg-black/70 p-4 text-white shadow-2xl backdrop-blur-md">
-                {hudDetails}
-              </div>
-            )}
-          </>
-        ) : isHudOpen ? (
+      {/* HUD */}
+      <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] left-[max(1rem,env(safe-area-inset-left))] z-20 flex flex-col gap-3 sm:top-[max(1.5rem,env(safe-area-inset-top))] sm:left-[max(1.5rem,env(safe-area-inset-left))]">
+        {(isMobileHud || !isHudOpen) && compactHud}
+        {isHudOpen && (isMobileHud ? (
+          <div className="pointer-events-auto max-h-[min(70vh,28rem)] w-[min(18rem,calc(100vw-2rem))] overflow-y-auto rounded-3xl border border-white/10 bg-black/70 p-4 text-white shadow-2xl backdrop-blur-md">
+            {hudDetails}
+          </div>
+        ) : (
           <div className="pointer-events-auto relative w-72 rounded-2xl border border-white/10 bg-black/60 p-5 pr-16 text-white shadow-xl backdrop-blur-md">
             <div className="absolute right-4 top-4">
               {hudToggleButton}
             </div>
             {hudDetails}
           </div>
-        ) : (
-          compactHud
-        )}
+        ))}
       </div>
 
       {lapCelebrationMessage && (
@@ -1735,7 +1575,7 @@ export default function App() {
       )}
 
       {isV2 ? (
-        <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] right-[max(1rem,env(safe-area-inset-right))] flex flex-col items-end gap-3 sm:top-6 sm:right-6">
+        <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] right-[max(1rem,env(safe-area-inset-right))] flex flex-col items-end gap-3 sm:top-[max(1.5rem,env(safe-area-inset-top))] sm:right-[max(1.5rem,env(safe-area-inset-right))]">
           <SpeedGauge mph={speedMph} />
           <canvas
             aria-label="Track map"
@@ -1758,31 +1598,16 @@ export default function App() {
 
       {/* On-screen Controls */}
       <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] left-[max(2rem,env(safe-area-inset-left))] flex gap-4">
-        <button 
-          className="w-16 h-16 bg-black/50 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-white/30 select-none touch-none"
-          onPointerDown={(e) => { e.preventDefault(); keys.current['arrowleft'] = true; }}
-          onPointerUp={(e) => { e.preventDefault(); keys.current['arrowleft'] = false; }}
-          onPointerLeave={(e) => { e.preventDefault(); keys.current['arrowleft'] = false; }}
-        >
+        <button aria-label="Steer left" className={`h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('arrowleft')}>
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m15 18-6-6 6-6"/></svg>
         </button>
-        <button 
-          className="w-16 h-16 bg-black/50 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-white/30 select-none touch-none"
-          onPointerDown={(e) => { e.preventDefault(); keys.current['arrowright'] = true; }}
-          onPointerUp={(e) => { e.preventDefault(); keys.current['arrowright'] = false; }}
-          onPointerLeave={(e) => { e.preventDefault(); keys.current['arrowright'] = false; }}
-        >
+        <button aria-label="Steer right" className={`h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('arrowright')}>
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m9 18 6-6-6-6"/></svg>
         </button>
       </div>
 
       <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] flex gap-4 items-end">
-        <button 
-          className="w-16 h-16 bg-black/50 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-white/30 select-none touch-none mb-2"
-          onPointerDown={(e) => { e.preventDefault(); keys.current['arrowdown'] = true; }}
-          onPointerUp={(e) => { e.preventDefault(); keys.current['arrowdown'] = false; }}
-          onPointerLeave={(e) => { e.preventDefault(); keys.current['arrowdown'] = false; }}
-        >
+        <button className={`mb-2 h-16 w-16 ${controlButtonClass}`} type="button" {...holdKey('arrowdown')}>
           <span className="font-bold text-xs uppercase tracking-wider">Brake</span>
         </button>
         <div className="flex flex-col items-center gap-6">
@@ -1806,11 +1631,10 @@ export default function App() {
               {!headlightsOn && <path d="M3 3l18 18" />}
             </svg>
           </button>
-          <button 
+          <button
             className="w-20 h-20 bg-rose-500/80 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-rose-400 select-none touch-none"
-            onPointerDown={(e) => { e.preventDefault(); keys.current['arrowup'] = true; }}
-            onPointerUp={(e) => { e.preventDefault(); keys.current['arrowup'] = false; }}
-            onPointerLeave={(e) => { e.preventDefault(); keys.current['arrowup'] = false; }}
+            type="button"
+            {...holdKey('arrowup')}
           >
             <span className="font-bold text-sm uppercase tracking-wider">Gas</span>
           </button>
@@ -1834,7 +1658,7 @@ export default function App() {
               autoCapitalize="characters"
               className="mt-6 w-full rounded-2xl border border-white/10 bg-slate-900/80 px-4 py-3 text-center text-3xl font-black uppercase tracking-[0.45em] text-cyan-100 outline-none transition focus:border-cyan-400"
               maxLength={3}
-              onChange={(event) => setInitialsInput(sanitizeInitials(event.target.value))}
+              onChange={(event) => setInitialsInput(normalizeInitials(event.target.value))}
               placeholder="ABC"
               spellCheck={false}
               value={initialsInput}

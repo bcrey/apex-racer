@@ -1,11 +1,13 @@
 // "V2" renderer. The classic look stays in App.tsx untouched; everything here
 // draws in world coordinates unless the function name says otherwise.
+import { shade } from './color';
 import {
+  getGridSlotPosition,
   HALF_TRACK_WIDTH,
   START_FINISH_X,
   START_FINISH_Y,
-  STARTING_GRID_OFFSET,
   TRACK_WIDTH,
+  traceTrack,
   trackPoints,
   type Point,
 } from './track';
@@ -46,12 +48,17 @@ export function getViewportZoomScale(width: number, height: number) {
 
 export const V2_TOP_SPEED = 19;
 
+// The car's footprint, shared by the body shadow and the headlight occluders
+export const CAR_HALF_LENGTH = 24;
+export const CAR_HALF_WIDTH = 14;
+
 const GRASS_LIGHT = '#1d8243';
 const GRASS_DARK = '#18733a';
 const GRASS_TUFT = '#135f2f';
 const GRASS_STRIPE = 180;
 const KERB_WIDTH = 22;
 const EDGE_INSET = 14;
+const PAINTED_GRID_SLOTS = 6;
 
 let asphaltPattern: CanvasPattern | null = null;
 
@@ -82,14 +89,6 @@ function getAsphaltPattern(ctx: CanvasRenderingContext2D) {
   return asphaltPattern;
 }
 
-function traceTrack(ctx: CanvasRenderingContext2D) {
-  ctx.beginPath();
-  ctx.moveTo(trackPoints[0].x, trackPoints[0].y);
-  for (let i = 1; i < trackPoints.length; i++) {
-    ctx.lineTo(trackPoints[i].x, trackPoints[i].y);
-  }
-}
-
 /** Mowed grass stripes and tufts covering the visible world rectangle. */
 export function drawGrassV2(ctx: CanvasRenderingContext2D, left: number, top: number, right: number, bottom: number) {
   const first = Math.floor(left / GRASS_STRIPE);
@@ -98,17 +97,19 @@ export function drawGrassV2(ctx: CanvasRenderingContext2D, left: number, top: nu
     ctx.fillRect(i * GRASS_STRIPE, top, GRASS_STRIPE, bottom - top);
   }
 
+  // All tufts in one path, one fill
   ctx.fillStyle = GRASS_TUFT;
+  ctx.beginPath();
   const spacing = 110;
   for (let x = Math.floor(left / spacing) * spacing; x < right + spacing; x += spacing) {
     for (let y = Math.floor(top / spacing) * spacing; y < bottom + spacing; y += spacing) {
-      const ox = Math.sin(x * 12.345 + y * 67.89) * 40;
-      const oy = Math.cos(x * 98.76 + y * 54.321) * 40;
-      ctx.beginPath();
-      ctx.ellipse(x + ox, y + oy, 7, 4, (x + y) * 0.01, 0, Math.PI * 2);
-      ctx.fill();
+      const tx = x + Math.sin(x * 12.345 + y * 67.89) * 40;
+      const ty = y + Math.cos(x * 98.76 + y * 54.321) * 40;
+      ctx.moveTo(tx + 7, ty);
+      ctx.ellipse(tx, ty, 7, 4, (x + y) * 0.01, 0, Math.PI * 2);
     }
   }
+  ctx.fill();
 }
 
 /** Kerbs, textured asphalt, edge lines, start/finish and grid boxes. */
@@ -158,19 +159,18 @@ export function drawTrackV2(ctx: CanvasRenderingContext2D) {
   }
   ctx.restore();
 
-  // Painted grid boxes behind the line (matches getGridPlacement in App.tsx)
+  // Painted grid boxes where cars line up
   ctx.strokeStyle = 'rgba(248, 250, 252, 0.7)';
   ctx.lineWidth = 4;
-  for (let slot = 0; slot < 6; slot++) {
-    const x = START_FINISH_X - STARTING_GRID_OFFSET - Math.floor(slot / 2) * 120;
-    const y = slot % 2 === 0 ? -80 : 80;
-    ctx.beginPath();
+  ctx.beginPath();
+  for (let slot = 0; slot < PAINTED_GRID_SLOTS; slot++) {
+    const { x, y } = getGridSlotPosition(slot);
     ctx.moveTo(x + 30, y - 22);
     ctx.lineTo(x + 38, y - 22);
     ctx.lineTo(x + 38, y + 22);
     ctx.lineTo(x + 30, y + 22);
-    ctx.stroke();
   }
+  ctx.stroke();
 }
 
 /** Continuous rubber lines (or churned ruts on grass) instead of dotted circles. */
@@ -206,7 +206,7 @@ export function spawnSmoke(particles: SmokeParticle[], x: number, y: number, vx:
   });
 }
 
-export function updateAndDrawSmoke(ctx: CanvasRenderingContext2D, particles: SmokeParticle[]) {
+export function updateSmoke(particles: SmokeParticle[]) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     p.x += p.vx;
@@ -214,21 +214,38 @@ export function updateAndDrawSmoke(ctx: CanvasRenderingContext2D, particles: Smo
     p.vx *= 0.95;
     p.vy *= 0.95;
     p.life -= 1;
-    if (p.life <= 0) {
-      particles.splice(i, 1);
-      continue;
-    }
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
 
+// One soft puff, drawn once and stamped per particle
+let puffSprite: HTMLCanvasElement | null = null;
+
+function getPuffSprite() {
+  if (puffSprite) return puffSprite;
+  const size = 64;
+  puffSprite = document.createElement('canvas');
+  puffSprite.width = size;
+  puffSprite.height = size;
+  const ctx = puffSprite.getContext('2d')!;
+  const puff = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  puff.addColorStop(0, 'rgba(226, 232, 240, 1)');
+  puff.addColorStop(1, 'rgba(226, 232, 240, 0)');
+  ctx.fillStyle = puff;
+  ctx.fillRect(0, 0, size, size);
+  return puffSprite;
+}
+
+export function drawSmoke(ctx: CanvasRenderingContext2D, particles: SmokeParticle[]) {
+  const sprite = getPuffSprite();
+  ctx.save();
+  for (const p of particles) {
     const age = 1 - p.life / p.maxLife;
     const radius = p.size * (1 + age * 2.2);
-    const puff = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius);
-    puff.addColorStop(0, `rgba(226, 232, 240, ${(1 - age) * 0.22})`);
-    puff.addColorStop(1, 'rgba(226, 232, 240, 0)');
-    ctx.fillStyle = puff;
-    ctx.beginPath();
-    ctx.arc(p.x, p.y, radius, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.globalAlpha = (1 - age) * 0.22;
+    ctx.drawImage(sprite, p.x - radius, p.y - radius, radius * 2, radius * 2);
   }
+  ctx.restore();
 }
 
 const GRASS_BITS = ['#4ade80', '#22c55e', '#16a34a', '#86efac', '#15803d'];
@@ -271,8 +288,7 @@ export function spawnGrass(
   }
 }
 
-export function updateAndDrawGrass(ctx: CanvasRenderingContext2D, particles: GrassParticle[]) {
-  ctx.lineCap = 'round';
+export function updateGrass(particles: GrassParticle[]) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     p.life -= 1;
@@ -280,9 +296,7 @@ export function updateAndDrawGrass(ctx: CanvasRenderingContext2D, particles: Gra
       particles.splice(i, 1);
       continue;
     }
-
-    const airborne = p.z > 0 || p.vz > 0;
-    if (airborne) {
+    if (p.z > 0 || p.vz > 0) {
       p.x += p.vx;
       p.y += p.vy;
       p.z += p.vz;
@@ -295,45 +309,83 @@ export function updateAndDrawGrass(ctx: CanvasRenderingContext2D, particles: Gra
         p.vz = 0;
       }
     }
+  }
+}
 
+export function drawGrass(ctx: CanvasRenderingContext2D, particles: GrassParticle[]) {
+  ctx.save();
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 1;
+  for (const p of particles) {
     const alpha = Math.min(1, p.life / 20);
+    const y = p.y - p.z;
 
     // Shadow on the ground shrinks as the bit rises
     if (p.z > 0) {
-      ctx.fillStyle = `rgba(0, 0, 0, ${0.25 * alpha})`;
+      ctx.globalAlpha = 0.25 * alpha;
+      ctx.fillStyle = '#000';
       ctx.beginPath();
       ctx.arc(p.x, p.y, Math.max(0.5, p.length * 0.4 - p.z * 0.025), 0, Math.PI * 2);
       ctx.fill();
     }
 
-    ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.translate(p.x, p.y - p.z);
-    ctx.rotate(p.rotation);
-    ctx.fillStyle = p.color;
-    ctx.strokeStyle = p.color;
+    ctx.beginPath();
     if (p.clod) {
-      ctx.beginPath();
-      ctx.arc(0, 0, p.length, 0, Math.PI * 2);
+      ctx.fillStyle = p.color;
+      ctx.arc(p.x, y, p.length, 0, Math.PI * 2);
       ctx.fill();
     } else {
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(-p.length / 2, 0);
-      ctx.lineTo(p.length / 2, 0);
+      const dx = Math.cos(p.rotation) * p.length / 2;
+      const dy = Math.sin(p.rotation) * p.length / 2;
+      ctx.strokeStyle = p.color;
+      ctx.moveTo(p.x - dx, y - dy);
+      ctx.lineTo(p.x + dx, y + dy);
       ctx.stroke();
     }
-    ctx.restore();
   }
+  ctx.restore();
 }
 
-function shade(hex: string, amount: number) {
-  const n = parseInt(hex.slice(1), 16);
-  const mix = (c: number) => Math.round(amount < 0 ? c * (1 + amount) : c + (255 - c) * amount);
-  const r = mix((n >> 16) & 255);
-  const g = mix((n >> 8) & 255);
-  const b = mix(n & 255);
-  return `rgb(${r}, ${g}, ${b})`;
+const TYRES = [[16, -12, true], [16, 12, true], [-10, -12, false], [-10, 12, false]] as const;
+
+// Gradients are in car-local coordinates, so each one is built once and reused
+const bodyGradients = new Map<string, CanvasGradient>();
+const bloomGradients = new Map<number, CanvasGradient>();
+let glassGradient: CanvasGradient | null = null;
+
+function getBodyGradient(ctx: CanvasRenderingContext2D, color: string) {
+  let body = bodyGradients.get(color);
+  if (!body) {
+    body = ctx.createLinearGradient(0, -11, 0, 11);
+    body.addColorStop(0, shade(color, 0.35));
+    body.addColorStop(0.45, color);
+    body.addColorStop(1, shade(color, -0.45));
+    bodyGradients.set(color, body);
+  }
+  return body;
+}
+
+function getGlassGradient(ctx: CanvasRenderingContext2D) {
+  if (!glassGradient) {
+    glassGradient = ctx.createLinearGradient(-8, -7, 10, 7);
+    glassGradient.addColorStop(0, '#1e3a5f');
+    glassGradient.addColorStop(0.5, '#0b1220');
+    glassGradient.addColorStop(1, '#020617');
+  }
+  return glassGradient;
+}
+
+/** Lamp bloom centred on the origin; draw it translated to each lamp. */
+function getBloomGradient(ctx: CanvasRenderingContext2D, strength: number) {
+  let bloom = bloomGradients.get(strength);
+  if (!bloom) {
+    bloom = ctx.createRadialGradient(0, 0, 0, 0, 0, 9);
+    bloom.addColorStop(0, `rgba(255, 244, 214, ${0.4 * strength})`);
+    bloom.addColorStop(1, 'rgba(255, 244, 214, 0)');
+    bloomGradients.set(strength, bloom);
+  }
+  return bloom;
 }
 
 /**
@@ -356,7 +408,7 @@ export function drawCarV2(
   ctx.rotate(angle);
   ctx.fillStyle = 'rgba(0, 0, 0, 0.32)';
   ctx.beginPath();
-  ctx.roundRect(-24, -14, 49, 28, 9);
+  ctx.roundRect(-CAR_HALF_LENGTH, -CAR_HALF_WIDTH, CAR_HALF_LENGTH * 2, CAR_HALF_WIDTH * 2, 9);
   ctx.fill();
   ctx.restore();
 
@@ -366,7 +418,7 @@ export function drawCarV2(
 
   // Tyres (fronts turn with steering input)
   ctx.fillStyle = '#0b0f19';
-  for (const [tx, ty, turn] of [[16, -12, true], [16, 12, true], [-10, -12, false], [-10, 12, false]] as const) {
+  for (const [tx, ty, turn] of TYRES) {
     ctx.save();
     ctx.translate(tx, ty);
     if (turn) ctx.rotate(steer * 0.4);
@@ -377,11 +429,7 @@ export function drawCarV2(
   }
 
   // Body with a top-lit gradient
-  const body = ctx.createLinearGradient(0, -11, 0, 11);
-  body.addColorStop(0, shade(color, 0.35));
-  body.addColorStop(0.45, color);
-  body.addColorStop(1, shade(color, -0.45));
-  ctx.fillStyle = body;
+  ctx.fillStyle = getBodyGradient(ctx, color);
   ctx.beginPath();
   ctx.moveTo(-21, -11);
   ctx.lineTo(12, -11);
@@ -402,11 +450,7 @@ export function drawCarV2(
   ctx.fillRect(-20, 1, 42, 2.5);
 
   // Canopy with a glass highlight
-  const glass = ctx.createLinearGradient(-8, -7, 10, 7);
-  glass.addColorStop(0, '#1e3a5f');
-  glass.addColorStop(0.5, '#0b1220');
-  glass.addColorStop(1, '#020617');
-  ctx.fillStyle = glass;
+  ctx.fillStyle = getGlassGradient(ctx);
   ctx.beginPath();
   ctx.roundRect(-9, -7.5, 20, 15, 5);
   ctx.fill();
@@ -432,12 +476,11 @@ export function drawCarV2(
   if (options.lights) {
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = getBloomGradient(ctx, options.lights);
     for (const ly of [-6.5, 6.5]) {
-      const bloom = ctx.createRadialGradient(21, ly, 0, 21, ly, 9);
-      bloom.addColorStop(0, `rgba(255, 244, 214, ${0.4 * options.lights})`);
-      bloom.addColorStop(1, 'rgba(255, 244, 214, 0)');
-      ctx.fillStyle = bloom;
-      ctx.fillRect(12, ly - 9, 18, 18);
+      ctx.translate(21, ly);
+      ctx.fillRect(-9, -9, 18, 18);
+      ctx.translate(-21, -ly);
     }
     ctx.restore();
   }
@@ -447,14 +490,21 @@ export function drawCarV2(
   ctx.ellipse(20.5, 6.5, 2, 2.6, -0.3, 0, Math.PI * 2);
   ctx.fill();
 
-  // Tail lights flare under braking
+  // Tail lights flare under braking (an additive halo, not shadowBlur,
+  // which costs a blur pass per fill)
   const braking = options.braking ?? false;
   ctx.fillStyle = braking ? '#ff4d4d' : '#b91c1c';
-  ctx.shadowColor = '#ef4444';
-  ctx.shadowBlur = braking ? 16 : 4;
   ctx.fillRect(-23, -9, 2.5, 5);
   ctx.fillRect(-23, 4, 2.5, 5);
-  ctx.shadowBlur = 0;
+  if (braking) {
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.35)';
+    ctx.beginPath();
+    ctx.roundRect(-27, -11, 8, 9, 3);
+    ctx.roundRect(-27, 2, 8, 9, 3);
+    ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
 
   ctx.restore();
 }
@@ -480,8 +530,11 @@ function getBeamSprite() {
   const halfAngle = (26 * Math.PI) / 180;
   const smooth = (t: number) => t * t * (3 - 2 * t);
 
-  for (let py = 0; py < h; py++) {
-    for (let px = 0; px < w; px++) {
+  // Only visit pixels inside the cone; the rest stay transparent
+  const tanHalf = Math.tan(halfAngle);
+  for (let px = 1; px < w; px++) {
+    const spread = Math.ceil(px * tanHalf);
+    for (let py = Math.max(0, h / 2 - spread); py < Math.min(h, h / 2 + spread); py++) {
       const x = px / BEAM_SPRITE_SCALE;
       const y = (py - h / 2) / BEAM_SPRITE_SCALE;
       const r = Math.hypot(x, y);
@@ -515,10 +568,17 @@ function getBeamSprite() {
   return beamSprite;
 }
 
+/** How far from a car its headlights can reach, for culling. */
+export const HEADLIGHT_REACH = BEAM_LENGTH + CAR_HALF_LENGTH * 2;
+
+/** Builds the beam sprite ahead of time so the first lit frame does not stall. */
+export function prepareHeadlights() {
+  getBeamSprite();
+}
+
 const LAMP_OFFSETS = [[-6.5, -0.09], [6.5, 0.09]] as const;
 const LAMP_FORWARD = 21;
-const CAR_HALF_LENGTH = 24;
-const CAR_HALF_WIDTH = 14;
+const CORNER_SIGNS = [[1, 1], [1, -1], [-1, -1], [-1, 1]] as const;
 // Each lamp removes this much light behind an occluder; where both lamps are
 // blocked the shadow is darkest, where only one is you get a soft penumbra.
 const SHADOW_PER_LAMP = 0.55;
@@ -535,7 +595,7 @@ function lampPosition(car: { x: number; y: number; angle: number }, lateral: num
 function carCorners(car: Occluder) {
   const cos = Math.cos(car.angle);
   const sin = Math.sin(car.angle);
-  return ([[1, 1], [1, -1], [-1, -1], [-1, 1]] as const).map(([fx, fy]) => ({
+  return CORNER_SIGNS.map(([fx, fy]) => ({
     x: car.x + cos * CAR_HALF_LENGTH * fx - sin * CAR_HALF_WIDTH * fy,
     y: car.y + sin * CAR_HALF_LENGTH * fx + cos * CAR_HALF_WIDTH * fy,
   }));
@@ -544,16 +604,19 @@ function carCorners(car: Occluder) {
 /** Knocks the shadow a car casts from one lamp out of the light layer. */
 function cutShadow(ctx: CanvasRenderingContext2D, lamp: Point, occluder: Occluder) {
   const toCenter = Math.atan2(occluder.y - lamp.y, occluder.x - lamp.x);
-  let min: { p: Point; a: number } | null = null;
-  let max: { p: Point; a: number } | null = null;
-  for (const p of carCorners(occluder)) {
-    // Angle relative to the lamp-to-car direction, so there is no wrap-around
-    let a = Math.atan2(p.y - lamp.y, p.x - lamp.x) - toCenter;
-    a = Math.atan2(Math.sin(a), Math.cos(a));
-    if (!min || a < min.a) min = { p, a };
-    if (!max || a > max.a) max = { p, a };
+  // Angle relative to the lamp-to-car direction, so there is no wrap-around
+  const relative = (p: Point) => {
+    const a = Math.atan2(p.y - lamp.y, p.x - lamp.x) - toCenter;
+    return Math.atan2(Math.sin(a), Math.cos(a));
+  };
+  const corners = carCorners(occluder);
+  let min = { p: corners[0], a: relative(corners[0]) };
+  let max = min;
+  for (const p of corners.slice(1)) {
+    const a = relative(p);
+    if (a < min.a) min = { p, a };
+    if (a > max.a) max = { p, a };
   }
-  if (!min || !max) return;
 
   const reach = BEAM_LENGTH * 1.5;
   const far = (p: Point) => {
@@ -610,7 +673,7 @@ export function drawLightLayerV2(light: CanvasRenderingContext2D, sources: Light
       const dy = occluder.y - source.y;
       // Only cars ahead of the lamps and within reach of the beam
       if (dx * forwardX + dy * forwardY <= 0) continue;
-      if (Math.hypot(dx, dy) > BEAM_LENGTH + CAR_HALF_LENGTH * 2) continue;
+      if (Math.hypot(dx, dy) > HEADLIGHT_REACH) continue;
       for (const [ly] of LAMP_OFFSETS) {
         cutShadow(light, lampPosition(source, ly), occluder);
       }
@@ -632,16 +695,6 @@ export function drawLocalMarker(ctx: CanvasRenderingContext2D, x: number, y: num
   ctx.restore();
 }
 
-/** Screen-space vignette that pulls focus to the car. */
-export function drawVignette(ctx: CanvasRenderingContext2D, width: number, height: number) {
-  const radius = Math.hypot(width, height) / 2;
-  const gradient = ctx.createRadialGradient(width / 2, height / 2, radius * 0.45, width / 2, height / 2, radius);
-  gradient.addColorStop(0, 'rgba(2, 6, 23, 0)');
-  gradient.addColorStop(1, 'rgba(2, 6, 23, 0.4)');
-  ctx.fillStyle = gradient;
-  ctx.fillRect(0, 0, width, height);
-}
-
 const MINIMAP_BOUNDS = (() => {
   const xs = trackPoints.map((p) => p.x);
   const ys = trackPoints.map((p) => p.y);
@@ -655,72 +708,84 @@ const MINIMAP_BOUNDS = (() => {
 
 export const MINIMAP_ASPECT = (MINIMAP_BOUNDS.maxX - MINIMAP_BOUNDS.minX) / (MINIMAP_BOUNDS.maxY - MINIMAP_BOUNDS.minY);
 
+type MinimapState = { ctx: CanvasRenderingContext2D; width: number; height: number; dpr: number; base: HTMLCanvasElement };
+const minimapStates = new WeakMap<HTMLCanvasElement, MinimapState>();
+const MINIMAP_PAD = 10;
+
+function minimapScale(width: number, height: number) {
+  return Math.min(
+    (width - MINIMAP_PAD * 2) / (MINIMAP_BOUNDS.maxX - MINIMAP_BOUNDS.minX),
+    (height - MINIMAP_PAD * 2) / (MINIMAP_BOUNDS.maxY - MINIMAP_BOUNDS.minY),
+  );
+}
+
+/** The track and start tick never change, so draw them once per size. */
+function drawMinimapBase(width: number, height: number, dpr: number) {
+  const base = document.createElement('canvas');
+  base.width = Math.round(width * dpr);
+  base.height = Math.round(height * dpr);
+  const ctx = base.getContext('2d')!;
+  const scale = minimapScale(width, height);
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * (MINIMAP_PAD - MINIMAP_BOUNDS.minX * scale), dpr * (MINIMAP_PAD - MINIMAP_BOUNDS.minY * scale));
+
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  traceTrack(ctx);
+  ctx.lineWidth = Math.max(4 / scale, TRACK_WIDTH);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
+  ctx.stroke();
+  ctx.lineWidth = 1.5 / scale;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+  ctx.stroke();
+
+  const tick = Math.max(3 / scale, HALF_TRACK_WIDTH);
+  ctx.strokeStyle = '#f8fafc';
+  ctx.lineWidth = 2 / scale;
+  ctx.beginPath();
+  ctx.moveTo(START_FINISH_X, START_FINISH_Y - tick);
+  ctx.lineTo(START_FINISH_X, START_FINISH_Y + tick);
+  ctx.stroke();
+  return base;
+}
+
 /** Draws the whole circuit and every car into a small canvas of its own. */
 export function drawMinimap(
   canvas: HTMLCanvasElement,
   local: MinimapCar & { angle: number },
-  others: MinimapCar[],
+  others: Iterable<MinimapCar>,
 ) {
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return;
-
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const cssWidth = canvas.clientWidth;
-  const cssHeight = canvas.clientHeight;
-  if (canvas.width !== Math.round(cssWidth * dpr) || canvas.height !== Math.round(cssHeight * dpr)) {
-    canvas.width = Math.round(cssWidth * dpr);
-    canvas.height = Math.round(cssHeight * dpr);
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  let state = minimapStates.get(canvas);
+  if (!state || state.width !== width || state.height !== height || state.dpr !== dpr) {
+    const ctx = state?.ctx ?? canvas.getContext('2d');
+    if (!ctx) return;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    state = { ctx, width, height, dpr, base: drawMinimapBase(width, height, dpr) };
+    minimapStates.set(canvas, state);
   }
+
+  const { ctx, base } = state;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(base, 0, 0);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, cssWidth, cssHeight);
 
-  const pad = 10;
-  const scale = Math.min(
-    (cssWidth - pad * 2) / (MINIMAP_BOUNDS.maxX - MINIMAP_BOUNDS.minX),
-    (cssHeight - pad * 2) / (MINIMAP_BOUNDS.maxY - MINIMAP_BOUNDS.minY),
-  );
-  const toMap = (p: Point) => ({
-    x: pad + (p.x - MINIMAP_BOUNDS.minX) * scale,
-    y: pad + (p.y - MINIMAP_BOUNDS.minY) * scale,
-  });
-
-  ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  trackPoints.forEach((p, i) => {
-    const m = toMap(p);
-    if (i === 0) ctx.moveTo(m.x, m.y);
-    else ctx.lineTo(m.x, m.y);
-  });
-  ctx.lineWidth = Math.max(4, TRACK_WIDTH * scale);
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.16)';
-  ctx.stroke();
-  ctx.lineWidth = 1.5;
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
-  ctx.stroke();
-
-  // Start/finish tick
-  const sf = toMap({ x: START_FINISH_X, y: START_FINISH_Y });
-  const tick = Math.max(3, HALF_TRACK_WIDTH * scale);
-  ctx.strokeStyle = '#f8fafc';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(sf.x, sf.y - tick);
-  ctx.lineTo(sf.x, sf.y + tick);
-  ctx.stroke();
+  const scale = minimapScale(width, height);
+  const mapX = (x: number) => MINIMAP_PAD + (x - MINIMAP_BOUNDS.minX) * scale;
+  const mapY = (y: number) => MINIMAP_PAD + (y - MINIMAP_BOUNDS.minY) * scale;
 
   for (const car of others) {
-    const m = toMap(car);
     ctx.fillStyle = car.color;
     ctx.beginPath();
-    ctx.arc(m.x, m.y, 3, 0, Math.PI * 2);
+    ctx.arc(mapX(car.x), mapY(car.y), 3, 0, Math.PI * 2);
     ctx.fill();
   }
 
   // Local car as an arrow pointing where it is heading
-  const me = toMap(local);
-  ctx.save();
-  ctx.translate(me.x, me.y);
+  ctx.translate(mapX(local.x), mapY(local.y));
   ctx.rotate(local.angle);
   ctx.fillStyle = local.color;
   ctx.strokeStyle = '#f8fafc';
@@ -733,5 +798,4 @@ export function drawMinimap(
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
-  ctx.restore();
 }

@@ -1,3 +1,6 @@
+import { memo } from 'react';
+import { mixHex } from './color';
+
 // V2 speedometer: a 270° dial of tick marks that light up as speed rises,
 // with a red zone at the top end.
 
@@ -24,37 +27,25 @@ const TICKS = Array.from({ length: MAX_MPH / TICK_STEP_MPH + 1 }, (_, i) => {
     y2: 50 + Math.sin(angle) * outer,
     // Rose at rest through orange; the red zone is its own colour
     color: mph >= REDLINE_MPH ? '#ef4444' : mixHex('#fb7185', '#fb923c', mph / REDLINE_MPH),
+    dim: mph >= REDLINE_MPH ? 'rgba(239, 68, 68, 0.3)' : 'rgba(255, 255, 255, 0.18)',
   };
 });
 
-function mixHex(a: string, b: string, t: number) {
-  const pa = parseInt(a.slice(1), 16);
-  const pb = parseInt(b.slice(1), 16);
-  const channel = (shift: number) => Math.round(((pa >> shift) & 255) * (1 - t) + ((pb >> shift) & 255) * t);
-  return `rgb(${channel(16)}, ${channel(8)}, ${channel(0)})`;
-}
-
-export default function SpeedGauge({ mph }: { mph: number }) {
+function SpeedGauge({ mph }: { mph: number }) {
   return (
     <div className="relative flex h-28 w-28 items-center justify-center rounded-full border border-white/10 bg-black/60 text-white shadow-xl backdrop-blur-md sm:h-36 sm:w-36">
       <svg aria-hidden="true" className="absolute inset-0 h-full w-full" viewBox="0 0 100 100">
-        {TICKS.map((tick) => {
-          const lit = mph > 0 && tick.mph <= mph;
-          const redZone = tick.mph >= REDLINE_MPH;
-          return (
-            <line
-              key={tick.mph}
-              stroke={lit ? tick.color : redZone ? 'rgba(239, 68, 68, 0.3)' : 'rgba(255, 255, 255, 0.18)'}
-              strokeLinecap="round"
-              strokeWidth={tick.major ? 2.6 : 1.6}
-              style={lit ? { filter: `drop-shadow(0 0 1.5px ${tick.color})` } : undefined}
-              x1={tick.x1}
-              x2={tick.x2}
-              y1={tick.y1}
-              y2={tick.y2}
-            />
-          );
-        })}
+        {/* One glow filter on the lit group rather than one per tick */}
+        <g>
+          {TICKS.filter((tick) => mph === 0 || tick.mph > mph).map((tick) => (
+            tickLine(tick, tick.dim)
+          ))}
+        </g>
+        <g style={{ filter: 'drop-shadow(0 0 1.5px rgba(251, 146, 60, 0.8))' }}>
+          {TICKS.filter((tick) => mph > 0 && tick.mph <= mph).map((tick) => (
+            tickLine(tick, tick.color)
+          ))}
+        </g>
       </svg>
       <div className="flex flex-col items-center">
         <span className="text-4xl font-black italic tabular-nums tracking-tighter sm:text-5xl">{mph}</span>
@@ -63,3 +54,21 @@ export default function SpeedGauge({ mph }: { mph: number }) {
     </div>
   );
 }
+
+function tickLine(tick: (typeof TICKS)[number], stroke: string) {
+  return (
+    <line
+      key={tick.mph}
+      stroke={stroke}
+      strokeLinecap="round"
+      strokeWidth={tick.major ? 2.6 : 1.6}
+      x1={tick.x1}
+      x2={tick.x2}
+      y1={tick.y1}
+      y2={tick.y2}
+    />
+  );
+}
+
+// Speed is a whole number, so most frames it is unchanged and this skips work
+export default memo(SpeedGauge);

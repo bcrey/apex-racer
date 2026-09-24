@@ -1,20 +1,37 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
-</div>
+# Apex Racer
 
-# Run and deploy your AI Studio app
+A top-down multiplayer drift racer in the browser: lap timing, a daily and
+all-time leaderboard, and two graphics styles (V1 and V2) switchable in the HUD.
 
-This contains everything you need to run your app locally.
+Live at https://apex-racer.vercel.app
 
-View your app in AI Studio: https://ai.studio/apps/f67b51fc-4b03-49ca-b317-b4618b316005
+## Run locally
 
-## Run Locally
+Needs Node.js.
 
-**Prerequisites:**  Node.js
+```sh
+npm install
+npm run dev   # http://localhost:3004
+```
 
+`npm run dev` starts `server.ts`: an Express server that serves the app through
+Vite, the leaderboard API, and a WebSocket server for multiplayer.
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Environment
+
+Put these in `.env.local` (see `.env.example`). Everything is optional; without
+them the game runs solo with no saved leaderboard.
+
+| Variable | Used for |
+| --- | --- |
+| `DATABASE_URL` | Postgres connection for the leaderboard. On Vercel use the Supabase Session Pooler URL. |
+| `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY` | Supabase Realtime multiplayer. When set, it is used instead of the local WebSocket server. |
+
+## Layout
+
+- `src/App.tsx`: game loop, physics, V1 renderer, HUD
+- `src/graphicsV2.ts`, `src/SpeedGauge.tsx`: V2 renderer and speedometer
+- `src/track.ts`: track layout and starting grid, shared with `server.ts`
+- `lib/leaderboard.ts`: leaderboard database access; `lib/leaderboardShared.ts` holds the parts the browser also uses
+- `api/leaderboard.ts`: the leaderboard as a Vercel function
+- `scripts/brand/`: sources for the Open Graph card and icons (`render.sh` regenerates them)
