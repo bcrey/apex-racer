@@ -181,6 +181,7 @@ async function startServer() {
           angle?: number;
           vx?: number;
           vy?: number;
+          lights?: boolean;
         };
 
         if (msg.type !== 'update') {
@@ -206,6 +207,7 @@ async function startServer() {
           angle: player.angle,
           vx: player.vx,
           vy: player.vy,
+          lights: msg.lights,
         });
 
         wss.clients.forEach((client) => {

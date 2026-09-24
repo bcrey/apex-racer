@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+/* The game owns the whole viewport: no page scroll or rubber-banding, which on
+   iOS slides the HUD under the browser toolbar. */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}

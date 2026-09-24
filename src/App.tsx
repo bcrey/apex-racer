@@ -4,6 +4,39 @@ import {
   getSupabaseClient,
   hasSupabaseRealtimeConfig,
 } from './lib/supabase';
+import {
+  HALF_TRACK_WIDTH,
+  START_FINISH_LINE_WIDTH,
+  START_FINISH_X,
+  START_FINISH_Y,
+  STARTING_GRID_OFFSET,
+  TRACK_WIDTH,
+  trackPoints,
+} from './track';
+import SpeedGauge from './SpeedGauge';
+import {
+  drawCarV2,
+  drawGrassV2,
+  drawLightLayerV2,
+  drawLocalMarker,
+  drawMinimap,
+  drawSkidMarksV2,
+  drawTrackV2,
+  drawVignette,
+  getViewportZoomScale,
+  MINIMAP_ASPECT,
+  spawnGrass,
+  spawnSmoke,
+  updateAndDrawGrass,
+  updateAndDrawSmoke,
+  V2_TOP_SPEED,
+  V2_ZOOM,
+  V2_ZOOM_AT_SPEED,
+  type GrassParticle,
+  type GraphicsMode,
+  type SkidMark,
+  type SmokeParticle,
+} from './graphicsV2';
 
 // --- Math & Physics Helpers ---
 function sqr(x: number) { return x * x; }
@@ -16,25 +49,6 @@ function distToSegmentSquared(p: {x: number, y: number}, v: {x: number, y: numbe
   return dist2(p, { x: v.x + t * (w.x - v.x), y: v.y + t * (w.y - v.y) });
 }
 
-// Track waypoints
-const trackPoints = [
-  {x: 0, y: 0},
-  {x: 1500, y: 0},
-  {x: 2000, y: 500},
-  {x: 2000, y: 1500},
-  {x: 1000, y: 1500},
-  {x: 500, y: 2000},
-  {x: 500, y: 2500},
-  {x: 1500, y: 2500},
-  {x: 2000, y: 3000},
-  {x: 2000, y: 4000},
-  {x: 0, y: 4000},
-  {x: -1000, y: 3000},
-  {x: -1000, y: 1000},
-  {x: -500, y: 500},
-  {x: 0, y: 0}
-];
-
 // Anti-cheat checkpoints
 const checkpoints = [
   {x: 2000, y: 1500},
@@ -42,12 +56,6 @@ const checkpoints = [
   {x: -1000, y: 1000}
 ];
 
-const TRACK_WIDTH = 400;
-const HALF_TRACK_WIDTH = TRACK_WIDTH / 2;
-const START_FINISH_LINE_WIDTH = 20;
-const START_FINISH_X = 900;
-const START_FINISH_Y = 0;
-const STARTING_GRID_OFFSET = 140;
 const DEFAULT_START_X = START_FINISH_X - STARTING_GRID_OFFSET;
 const DEFAULT_START_Y = -80;
 const PLAYER_COLORS = ['#ef4444', '#3b82f6', '#22c55e', '#eab308', '#a855f7', '#f97316', '#06b6d4', '#ec4899', '#84cc16', '#14b8a6'];
@@ -61,13 +69,14 @@ type RemotePlayer = {
   angle: number;
   vx: number;
   vy: number;
+  lights?: boolean;
 };
 
 type PresencePlayer = RemotePlayer & {
   slotIndex: number;
 };
 
-type CarUpdate = Pick<RemotePlayer, 'id' | 'x' | 'y' | 'angle' | 'vx' | 'vy'>;
+type CarUpdate = Pick<RemotePlayer, 'id' | 'x' | 'y' | 'angle' | 'vx' | 'vy' | 'lights'>;
 
 type MultiplayerConnection = {
   close: () => void;
@@ -119,6 +128,15 @@ const PODIUM_CONFETTI_COLORS = [
 ] as const;
 const EXPLOSION_COLORS = ['#ffffff', '#fde047', '#fb7185', '#f97316', '#ef4444'] as const;
 const EASTER_EGG_INITIALS = 'SLY';
+const GRAPHICS_MODE_STORAGE_KEY = 'apex-racer:graphics';
+
+function loadGraphicsMode(): GraphicsMode {
+  try {
+    return window.localStorage.getItem(GRAPHICS_MODE_STORAGE_KEY) === 'classic' ? 'classic' : 'v2';
+  } catch {
+    return 'v2';
+  }
+}
 
 function getDistanceToTrack(p: {x: number, y: number}) {
   let minDistSq = Infinity;
@@ -490,6 +508,12 @@ export default function App() {
   const [lapCelebrationMessage, setLapCelebrationMessage] = useState<string | null>(null);
   const [isResettingLeaderboard, setIsResettingLeaderboard] = useState(false);
   const clientTimeZone = useRef(getClientTimeZone());
+  const [graphicsMode, setGraphicsMode] = useState<GraphicsMode>(loadGraphicsMode);
+  const graphicsModeRef = useRef(graphicsMode);
+  const resizeCanvasRef = useRef<(() => void) | null>(null);
+  const minimapRef = useRef<HTMLCanvasElement>(null);
+  const [headlightsOn, setHeadlightsOn] = useState(true);
+  const headlightsOnRef = useRef(headlightsOn);
 
   // --- Multiplayer State ---
   const multiplayerRef = useRef<MultiplayerConnection | null>(null);
@@ -509,7 +533,10 @@ export default function App() {
     vx: 0, vy: 0,
     angle: 0,
   });
-  const skidMarks = useRef<{x: number, y: number, life: number}[]>([]);
+  const skidMarks = useRef<SkidMark[]>([]);
+  const skidStreak = useRef({ id: 0, active: false, onGrass: false });
+  const smokeParticles = useRef<SmokeParticle[]>([]);
+  const grassParticles = useRef<GrassParticle[]>([]);
   const gameState = useRef({
     nextCheckpoint: 0,
     lapStartTime: performance.now(),
@@ -553,6 +580,20 @@ export default function App() {
   useEffect(() => {
     leaderboardRef.current = leaderboard;
   }, [leaderboard]);
+
+  useEffect(() => {
+    headlightsOnRef.current = headlightsOn;
+  }, [headlightsOn]);
+
+  useEffect(() => {
+    graphicsModeRef.current = graphicsMode;
+    resizeCanvasRef.current?.();
+    try {
+      window.localStorage.setItem(GRAPHICS_MODE_STORAGE_KEY, graphicsMode);
+    } catch {
+      // Private mode or blocked storage: the choice just won't persist
+    }
+  }, [graphicsMode]);
 
   useEffect(() => {
     let cancelled = false;
@@ -660,6 +701,7 @@ export default function App() {
           angle: previousPlayer?.angle ?? player.angle,
           vx: previousPlayer?.vx ?? player.vx,
           vy: previousPlayer?.vy ?? player.vy,
+          lights: previousPlayer?.lights,
         });
       });
 
@@ -693,6 +735,7 @@ export default function App() {
               p.angle = msg.angle;
               p.vx = msg.vx;
               p.vy = msg.vy;
+              p.lights = msg.lights;
             }
           } else if (msg.type === 'leaderboard') {
             void loadLeaderboard();
@@ -745,6 +788,7 @@ export default function App() {
           existingPlayer.angle = payload.angle;
           existingPlayer.vx = payload.vx;
           existingPlayer.vy = payload.vy;
+          existingPlayer.lights = payload.lights;
           return;
         }
 
@@ -757,6 +801,7 @@ export default function App() {
           angle: payload.angle,
           vx: payload.vx,
           vy: payload.vy,
+          lights: payload.lights,
         });
       });
 
@@ -866,6 +911,9 @@ export default function App() {
     void initializeMultiplayer();
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'l' && !e.repeat) {
+        setHeadlightsOn((on) => !on);
+      }
       keys.current[e.key.toLowerCase()] = true;
       if (e.code === 'Space') keys.current.space = true;
     };
@@ -881,16 +929,37 @@ export default function App() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    // V2 headlights are painted here first, then laid over the scene
+    const lightCanvas = document.createElement('canvas');
+    const lightCtx = lightCanvas.getContext('2d');
+
+    // Classic renders at 1 canvas pixel per CSS pixel; V2 renders at the
+    // device pixel ratio so it stays sharp on high-density screens.
+    let pixelRatio = 1;
+    // Size from the canvas element, not window.inner*: on iOS those include
+    // space under the browser toolbars.
+    let viewWidth = canvas.clientWidth || window.innerWidth;
+    let viewHeight = canvas.clientHeight || window.innerHeight;
     const resize = () => {
-      canvas.width = window.innerWidth;
-      canvas.height = window.innerHeight;
+      pixelRatio = graphicsModeRef.current === 'v2' ? Math.min(window.devicePixelRatio || 1, 2) : 1;
+      viewWidth = canvas.clientWidth || window.innerWidth;
+      viewHeight = canvas.clientHeight || window.innerHeight;
+      canvas.width = Math.round(viewWidth * pixelRatio);
+      canvas.height = Math.round(viewHeight * pixelRatio);
+      lightCanvas.width = canvas.width;
+      lightCanvas.height = canvas.height;
     };
     window.addEventListener('resize', resize);
+    // Also catches iOS toolbars collapsing, which does not always fire resize
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(canvas);
+    resizeCanvasRef.current = resize;
     resize();
 
     let animationId: number;
-    let cameraX = canvas.width / 2;
-    let cameraY = canvas.height / 2;
+    let cameraX = viewWidth / 2;
+    let cameraY = viewHeight / 2;
+    let zoom = 1;
 
     const loop = (time: number) => {
       const c = car.current;
@@ -964,19 +1033,62 @@ export default function App() {
       c.x += c.vx;
       c.y += c.vy;
 
-      // Skid marks
-      if (Math.abs(lateralSpeed) > (isDrifting ? 1.5 : 3) && isOnTrack) {
+      // Skid marks (and, in V2, ruts and flying clippings on the grass)
+      const isV2Graphics = graphicsModeRef.current === 'v2';
+      const groundSpeed = Math.hypot(c.vx, c.vy);
+      const isSkidding = Math.abs(lateralSpeed) > (isDrifting ? 1.5 : 3) && isOnTrack;
+      const isRutting = isV2Graphics && !isOnTrack && groundSpeed > 2;
+      if (isSkidding || isRutting) {
+        if (!skidStreak.current.active || skidStreak.current.onGrass !== isRutting) {
+          skidStreak.current.id++;
+        }
+        const streak = skidStreak.current.id;
+        const surface = isRutting ? 'grass' as const : undefined;
         skidMarks.current.push({
           x: c.x + rightX * -11 - forwardX * 16,
           y: c.y + rightY * -11 - forwardY * 16,
-          life: 1.0
+          life: 1.0,
+          side: 0,
+          streak,
+          surface,
         });
         skidMarks.current.push({
           x: c.x + rightX * 11 - forwardX * 16,
           y: c.y + rightY * 11 - forwardY * 16,
-          life: 1.0
+          life: 1.0,
+          side: 1,
+          streak,
+          surface,
         });
       }
+      if (isRutting) {
+        for (const side of [-11, 11]) {
+          spawnGrass(
+            grassParticles.current,
+            c.x + rightX * side - forwardX * 18,
+            c.y + rightY * side - forwardY * 18,
+            c.vx,
+            c.vy,
+            forwardX,
+            forwardY,
+            groundSpeed,
+          );
+        }
+      }
+      if (isSkidding) {
+        if (isV2Graphics && Math.random() < 0.7) {
+          const side = Math.random() < 0.5 ? -11 : 11;
+          spawnSmoke(
+            smokeParticles.current,
+            c.x + rightX * side - forwardX * 18,
+            c.y + rightY * side - forwardY * 18,
+            c.vx,
+            c.vy,
+          );
+        }
+      }
+      skidStreak.current.active = isSkidding || isRutting;
+      skidStreak.current.onGrass = isRutting;
 
       for (let i = skidMarks.current.length - 1; i >= 0; i--) {
         skidMarks.current[i].life -= 0.02;
@@ -994,6 +1106,7 @@ export default function App() {
           angle: c.angle,
           vx: c.vx,
           vy: c.vy,
+          lights: headlightsOnRef.current,
         });
         lastSendTime.current = time;
       }
@@ -1040,8 +1153,8 @@ export default function App() {
                 : CONFETTI_COLORS;
               setLapCelebrationMessage('NEW RECORD!!!');
               confettiParticles.current.push(
-                ...createConfettiBurst('left', canvas.width, canvas.height, confettiColors),
-                ...createConfettiBurst('right', canvas.width, canvas.height, confettiColors),
+                ...createConfettiBurst('left', viewWidth, viewHeight, confettiColors),
+                ...createConfettiBurst('right', viewWidth, viewHeight, confettiColors),
               );
             } else {
               setLapCelebrationMessage(null);
@@ -1068,12 +1181,174 @@ export default function App() {
       }
 
       // --- Camera ---
-      const targetCameraX = canvas.width / 2 - (c.x + c.vx * 15);
-      const targetCameraY = canvas.height / 2 - (c.y + c.vy * 15);
+      const targetCameraX = viewWidth / 2 - (c.x + c.vx * 15);
+      const targetCameraY = viewHeight / 2 - (c.y + c.vy * 15);
       cameraX += (targetCameraX - cameraX) * 0.1;
       cameraY += (targetCameraY - cameraY) * 0.1;
 
       // --- Rendering ---
+      if (graphicsModeRef.current === 'v2') {
+        const speedRatio = Math.min(1, Math.hypot(c.vx, c.vy) / V2_TOP_SPEED);
+        const targetZoom = (V2_ZOOM + (V2_ZOOM_AT_SPEED - V2_ZOOM) * speedRatio) * getViewportZoomScale(viewWidth, viewHeight);
+        zoom += (targetZoom - zoom) * 0.05;
+        renderV2(isDestroyed, isBraking, steerInput);
+      } else {
+        zoom = 1;
+        renderClassic(isDestroyed);
+      }
+
+      animationId = requestAnimationFrame(loop);
+    };
+
+    // Draws the world in V2 style around the camera focus, then screen overlays.
+    const renderV2 = (isDestroyed: boolean, isBraking: boolean, steerInput: number) => {
+      const c = car.current;
+      ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+
+      const focusX = viewWidth / 2 - cameraX;
+      const focusY = viewHeight / 2 - cameraY;
+      const halfW = viewWidth / 2 / zoom;
+      const halfH = viewHeight / 2 / zoom;
+
+      ctx.save();
+      ctx.translate(viewWidth / 2, viewHeight / 2);
+      ctx.scale(zoom, zoom);
+      ctx.translate(-focusX, -focusY);
+
+      drawGrassV2(ctx, focusX - halfW, focusY - halfH, focusX + halfW, focusY + halfH);
+      drawTrackV2(ctx);
+      drawSkidMarksV2(ctx, skidMarks.current);
+      updateAndDrawSmoke(ctx, smokeParticles.current);
+      updateAndDrawGrass(ctx, grassParticles.current);
+
+      const localLights = headlightsOnRef.current && !isDestroyed ? 1 : 0;
+
+      remotePlayers.current.forEach(p => {
+        drawCarV2(ctx, p.x, p.y, p.angle, p.color, { lights: p.lights === false ? 0 : 0.5 });
+      });
+
+      drawExplosion();
+
+      if (!isDestroyed) {
+        drawLocalMarker(ctx, c.x, c.y, myColorRef.current);
+        drawCarV2(ctx, c.x, c.y, c.angle, myColorRef.current, { steer: steerInput, braking: isBraking, lights: localLights });
+      }
+
+      // Headlights go on after the cars so they light up any bodywork they hit,
+      // with shadows cut out behind every car in a beam.
+      const localId = myIdRef.current ?? 'local';
+      const lightSources = [
+        ...Array.from(remotePlayers.current.values(), (p: RemotePlayer) => ({
+          id: p.id, x: p.x, y: p.y, angle: p.angle, strength: p.lights === false ? 0 : 0.45,
+        })),
+        { id: localId, x: c.x, y: c.y, angle: c.angle, strength: localLights },
+      ];
+      if (lightCtx && lightSources.some(source => source.strength > 0)) {
+        lightCtx.setTransform(1, 0, 0, 1, 0, 0);
+        lightCtx.clearRect(0, 0, lightCanvas.width, lightCanvas.height);
+        lightCtx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        lightCtx.translate(viewWidth / 2, viewHeight / 2);
+        lightCtx.scale(zoom, zoom);
+        lightCtx.translate(-focusX, -focusY);
+        const occluders = [
+          ...Array.from(remotePlayers.current.values(), (p: RemotePlayer) => ({ id: p.id, x: p.x, y: p.y, angle: p.angle })),
+          ...(isDestroyed ? [] : [{ id: localId, x: c.x, y: c.y, angle: c.angle }]),
+        ];
+        drawLightLayerV2(lightCtx, lightSources, occluders);
+
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.globalCompositeOperation = 'screen';
+        ctx.drawImage(lightCanvas, 0, 0);
+        ctx.restore();
+      }
+
+      // Tags last so no car ever covers a name
+      remotePlayers.current.forEach(p => {
+        drawDriverTag(ctx, p.x, p.y, p.initials, p.color);
+      });
+
+      ctx.restore();
+
+      drawVignette(ctx, viewWidth, viewHeight);
+      drawConfetti();
+
+      const minimap = minimapRef.current;
+      if (minimap) {
+        drawMinimap(
+          minimap,
+          { x: c.x, y: c.y, angle: c.angle, color: myColorRef.current },
+          Array.from(remotePlayers.current.values()),
+        );
+      }
+    };
+
+    const drawExplosion = () => {
+      for (let i = explosionParticles.current.length - 1; i >= 0; i--) {
+        const particle = explosionParticles.current[i];
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        particle.vx *= 0.94;
+        particle.vy *= 0.94;
+        particle.life -= 1;
+
+        if (particle.life <= 0) {
+          explosionParticles.current.splice(i, 1);
+          continue;
+        }
+
+        ctx.save();
+        ctx.translate(particle.x, particle.y);
+        ctx.globalAlpha = Math.min(1, particle.life / 16);
+        ctx.fillStyle = particle.color;
+        ctx.shadowColor = particle.color;
+        ctx.shadowBlur = 18;
+        ctx.beginPath();
+        ctx.arc(0, 0, particle.size * (particle.life / 36), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+    };
+
+    const drawConfetti = () => {
+      for (let i = confettiParticles.current.length - 1; i >= 0; i--) {
+        const particle = confettiParticles.current[i];
+        particle.x += particle.vx;
+        particle.y += particle.vy;
+        particle.vx *= 0.992;
+        particle.vy += 0.35;
+        particle.rotation += particle.spin;
+        particle.life -= 1;
+
+        if (particle.life <= 0 || particle.y > viewHeight + 120) {
+          confettiParticles.current.splice(i, 1);
+          continue;
+        }
+
+        ctx.save();
+        ctx.translate(particle.x, particle.y);
+        ctx.rotate(particle.rotation);
+        ctx.globalAlpha = Math.min(1, particle.life / 18);
+        ctx.fillStyle = particle.color;
+
+        if (particle.shape === 'circle') {
+          ctx.beginPath();
+          ctx.arc(0, 0, particle.size * 0.45, 0, Math.PI * 2);
+          ctx.fill();
+        } else {
+          ctx.fillRect(-particle.size / 2, -particle.size * 0.35, particle.size, particle.size * 0.7);
+        }
+
+        ctx.restore();
+      }
+    };
+
+    const renderClassic = (isDestroyed: boolean) => {
+      const c = car.current;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      smokeParticles.current.length = 0;
+      grassParticles.current.length = 0;
+
       ctx.fillStyle = '#166534'; // Grass
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -1143,6 +1418,7 @@ export default function App() {
 
       // Skid marks
       skidMarks.current.forEach(mark => {
+        if (mark.surface === 'grass') return; // V2-only ruts
         ctx.fillStyle = `rgba(0, 0, 0, ${mark.life * 0.4})`;
         ctx.beginPath();
         ctx.arc(mark.x, mark.y, 5, 0, Math.PI * 2);
@@ -1156,69 +1432,15 @@ export default function App() {
       });
 
       // Local Car
-      for (let i = explosionParticles.current.length - 1; i >= 0; i--) {
-        const particle = explosionParticles.current[i];
-        particle.x += particle.vx;
-        particle.y += particle.vy;
-        particle.vx *= 0.94;
-        particle.vy *= 0.94;
-        particle.life -= 1;
-
-        if (particle.life <= 0) {
-          explosionParticles.current.splice(i, 1);
-          continue;
-        }
-
-        ctx.save();
-        ctx.translate(particle.x, particle.y);
-        ctx.globalAlpha = Math.min(1, particle.life / 16);
-        ctx.fillStyle = particle.color;
-        ctx.shadowColor = particle.color;
-        ctx.shadowBlur = 18;
-        ctx.beginPath();
-        ctx.arc(0, 0, particle.size * (particle.life / 36), 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
-      }
+      drawExplosion();
 
       if (!isDestroyed) {
-        drawCar(ctx, c.x, c.y, c.angle, myColorRef.current, true);
+        drawCar(ctx, c.x, c.y, c.angle, myColorRef.current, headlightsOnRef.current);
       }
 
       ctx.restore();
 
-      for (let i = confettiParticles.current.length - 1; i >= 0; i--) {
-        const particle = confettiParticles.current[i];
-        particle.x += particle.vx;
-        particle.y += particle.vy;
-        particle.vx *= 0.992;
-        particle.vy += 0.35;
-        particle.rotation += particle.spin;
-        particle.life -= 1;
-
-        if (particle.life <= 0 || particle.y > canvas.height + 120) {
-          confettiParticles.current.splice(i, 1);
-          continue;
-        }
-
-        ctx.save();
-        ctx.translate(particle.x, particle.y);
-        ctx.rotate(particle.rotation);
-        ctx.globalAlpha = Math.min(1, particle.life / 18);
-        ctx.fillStyle = particle.color;
-
-        if (particle.shape === 'circle') {
-          ctx.beginPath();
-          ctx.arc(0, 0, particle.size * 0.45, 0, Math.PI * 2);
-          ctx.fill();
-        } else {
-          ctx.fillRect(-particle.size / 2, -particle.size * 0.35, particle.size, particle.size * 0.7);
-        }
-
-        ctx.restore();
-      }
-
-      animationId = requestAnimationFrame(loop);
+      drawConfetti();
     };
     animationId = requestAnimationFrame(loop);
 
@@ -1228,6 +1450,8 @@ export default function App() {
       multiplayerRef.current = null;
       cancelAnimationFrame(animationId);
       window.removeEventListener('resize', resize);
+      resizeObserver.disconnect();
+      resizeCanvasRef.current = null;
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
     };
@@ -1333,12 +1557,45 @@ export default function App() {
     </div>
   );
 
+  const isV2 = graphicsMode === 'v2';
+  const graphicsToggle = (
+    <div className="mb-4 flex items-center justify-between gap-3">
+      <span id="graphics-mode-label" className="text-xs uppercase tracking-widest text-gray-400">Graphics</span>
+      <div
+        aria-labelledby="graphics-mode-label"
+        className="pointer-events-auto relative grid w-40 grid-cols-2 rounded-full border border-white/10 bg-white/5 p-1"
+        role="radiogroup"
+      >
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-full bg-gradient-to-r from-rose-500 to-orange-400 shadow-lg transition-transform duration-300 ease-out"
+          style={{ transform: isV2 ? 'translateX(100%)' : 'translateX(0)' }}
+        />
+        {(['classic', 'v2'] as const).map((mode) => (
+          <button
+            aria-checked={graphicsMode === mode}
+            className={`relative z-10 rounded-full py-1 text-[10px] font-bold uppercase tracking-[0.12em] transition-colors ${
+              graphicsMode === mode ? 'text-white' : 'text-white/50 hover:text-white/80'
+            }`}
+            key={mode}
+            onClick={() => setGraphicsMode(mode)}
+            role="radio"
+            type="button"
+          >
+            {mode === 'classic' ? 'Classic' : 'V2'}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
   const hudDetails = (
     <>
       <h1 className="mb-1 bg-gradient-to-r from-rose-400 to-orange-400 bg-clip-text text-xl font-black italic tracking-wider text-transparent sm:text-2xl">
         APEX RACER
       </h1>
-      <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive</p>
+      <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive, L for lights</p>
+      {graphicsToggle}
 
       <div className="space-y-2 font-mono">
         <div className="flex items-center justify-between gap-4 sm:gap-6">
@@ -1442,11 +1699,11 @@ export default function App() {
   );
 
   return (
-    <div className="relative w-full h-screen overflow-hidden bg-green-900 font-sans">
-      <canvas ref={canvasRef} className="block w-full h-full" />
+    <div className="fixed inset-0 overflow-hidden bg-green-900 font-sans">
+      <canvas ref={canvasRef} className="block h-full w-full touch-none" />
       
       {/* HUD */}
-      <div className="pointer-events-none absolute top-4 left-4 z-20 flex flex-col gap-3 sm:top-6 sm:left-6">
+      <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] left-[max(1rem,env(safe-area-inset-left))] z-20 flex flex-col gap-3 sm:top-6 sm:left-6">
         {isMobileHud ? (
           <>
             {compactHud}
@@ -1477,17 +1734,30 @@ export default function App() {
         </div>
       )}
 
-      <div className="absolute top-6 right-6 bg-black/60 text-white p-6 rounded-3xl backdrop-blur-md border border-white/10 shadow-xl flex flex-col items-end pointer-events-none">
-        <div className="text-5xl font-black italic tracking-tighter">
-          {speedMph}
+      {isV2 ? (
+        <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] right-[max(1rem,env(safe-area-inset-right))] flex flex-col items-end gap-3 sm:top-6 sm:right-6">
+          <SpeedGauge mph={speedMph} />
+          <canvas
+            aria-label="Track map"
+            className="w-24 rounded-2xl border border-white/10 bg-black/55 shadow-xl backdrop-blur-md sm:w-36"
+            ref={minimapRef}
+            role="img"
+            style={{ aspectRatio: MINIMAP_ASPECT }}
+          />
         </div>
-        <div className="text-rose-400 font-bold tracking-widest text-sm uppercase mt-1">
-          mph
+      ) : (
+        <div className="absolute top-6 right-6 bg-black/60 text-white p-6 rounded-3xl backdrop-blur-md border border-white/10 shadow-xl flex flex-col items-end pointer-events-none">
+          <div className="text-5xl font-black italic tracking-tighter">
+            {speedMph}
+          </div>
+          <div className="text-rose-400 font-bold tracking-widest text-sm uppercase mt-1">
+            mph
+          </div>
         </div>
-      </div>
+      )}
 
       {/* On-screen Controls */}
-      <div className="absolute bottom-8 left-8 flex gap-4">
+      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] left-[max(2rem,env(safe-area-inset-left))] flex gap-4">
         <button 
           className="w-16 h-16 bg-black/50 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-white/30 select-none touch-none"
           onPointerDown={(e) => { e.preventDefault(); keys.current['arrowleft'] = true; }}
@@ -1506,7 +1776,7 @@ export default function App() {
         </button>
       </div>
 
-      <div className="absolute bottom-8 right-8 flex gap-4 items-end">
+      <div className="absolute bottom-[max(2rem,env(safe-area-inset-bottom))] right-[max(2rem,env(safe-area-inset-right))] flex gap-4 items-end">
         <button 
           className="w-16 h-16 bg-black/50 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-white/30 select-none touch-none mb-2"
           onPointerDown={(e) => { e.preventDefault(); keys.current['arrowdown'] = true; }}
@@ -1515,14 +1785,36 @@ export default function App() {
         >
           <span className="font-bold text-xs uppercase tracking-wider">Brake</span>
         </button>
-        <button 
-          className="w-20 h-20 bg-rose-500/80 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-rose-400 select-none touch-none"
-          onPointerDown={(e) => { e.preventDefault(); keys.current['arrowup'] = true; }}
-          onPointerUp={(e) => { e.preventDefault(); keys.current['arrowup'] = false; }}
-          onPointerLeave={(e) => { e.preventDefault(); keys.current['arrowup'] = false; }}
-        >
-          <span className="font-bold text-sm uppercase tracking-wider">Gas</span>
-        </button>
+        <div className="flex flex-col items-center gap-6">
+          <button
+            aria-label={headlightsOn ? 'Turn headlights off (L)' : 'Turn headlights on (L)'}
+            aria-pressed={headlightsOn}
+            className={`flex h-12 w-12 select-none items-center justify-center rounded-full border backdrop-blur-md transition touch-none ${
+              headlightsOn
+                ? 'border-amber-200/60 bg-amber-300/90 text-slate-900 shadow-[0_0_18px_rgba(252,211,77,0.55)]'
+                : 'border-white/20 bg-black/50 text-white/70'
+            }`}
+            onPointerDown={(e) => { e.preventDefault(); setHeadlightsOn((on) => !on); }}
+            title="Headlights (L)"
+            type="button"
+          >
+            <svg fill="none" height="22" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24" width="22">
+              <path d="M14 6c3.6 0 6.5 2.7 6.5 6s-2.9 6-6.5 6c-.8 0-1.3-.5-1.3-1.3V7.3c0-.8.5-1.3 1.3-1.3Z" />
+              <path d="M3 8h6.5" />
+              <path d="M3 12h6.5" />
+              <path d="M3 16h6.5" />
+              {!headlightsOn && <path d="M3 3l18 18" />}
+            </svg>
+          </button>
+          <button 
+            className="w-20 h-20 bg-rose-500/80 backdrop-blur-md border border-white/20 rounded-full flex items-center justify-center text-white active:bg-rose-400 select-none touch-none"
+            onPointerDown={(e) => { e.preventDefault(); keys.current['arrowup'] = true; }}
+            onPointerUp={(e) => { e.preventDefault(); keys.current['arrowup'] = false; }}
+            onPointerLeave={(e) => { e.preventDefault(); keys.current['arrowup'] = false; }}
+          >
+            <span className="font-bold text-sm uppercase tracking-wider">Gas</span>
+          </button>
+        </div>
       </div>
 
       {!playerInitials && (
