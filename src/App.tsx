@@ -485,7 +485,7 @@ class ApiError extends Error {
 
 async function requestLeaderboard(errorMessage: string, init?: RequestInit, timeZone?: string) {
   const query = timeZone ? `?timeZone=${encodeURIComponent(timeZone)}` : '';
-  const response = await fetch(`/api/leaderboard${query}`, init);
+  const response = await fetch(`${import.meta.env.BASE_URL}api/leaderboard${query}`, init);
   if (!response.ok) {
     const detail = await response.json().catch(() => null) as { error?: string } | null;
     throw new ApiError(detail?.error ?? errorMessage, response.status);
@@ -512,7 +512,7 @@ const resetLeaderboard = (timeZone: string, adminToken: string) =>
 
 /** Asks the server to note when a lap started; the lap's submission must carry this token. */
 async function requestLapToken() {
-  const response = await fetch('/api/lap-start', { method: 'POST' });
+  const response = await fetch(`${import.meta.env.BASE_URL}api/lap-start`, { method: 'POST' });
   if (!response.ok) {
     throw new ApiError('Unable to start lap', response.status);
   }
@@ -724,7 +724,8 @@ export default function App() {
     setLapReadyToFinish(false);
     setLapCelebrationMessage(null);
     setLapFlash(null);
-    const isVercelHost = window.location.hostname.endsWith('.vercel.app');
+    // The WebSocket multiplayer server only exists in `npm run dev`
+    const hasLocalServer = import.meta.env.DEV;
     multiplayerRef.current = null;
 
     // Race state that only the game loop touches. `tick` counts physics steps
@@ -939,13 +940,13 @@ export default function App() {
         } catch (error) {
           console.error('Unable to connect to Supabase Realtime', error);
         }
-      } else if (isVercelHost) {
+      } else if (!hasLocalServer) {
         console.warn(
           `Supabase Realtime is not configured. Missing env vars: ${getMissingSupabaseRealtimeEnvVars().join(', ')}`,
         );
       }
 
-      if (!isVercelHost) {
+      if (hasLocalServer) {
         multiplayerRef.current = setupLocalWebSocketConnection();
       }
     };
