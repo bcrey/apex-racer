@@ -3,7 +3,8 @@
 // the drawn car eases onto it instead of jumping.
 import { lerp } from './physics';
 
-export type NetworkCarState = { x: number; y: number; angle: number; vx: number; vy: number };
+/** `z` is height in the air (Stunt Park jumps); absent means on the ground. */
+export type NetworkCarState = { x: number; y: number; angle: number; vx: number; vy: number; z?: number };
 
 export type RemoteCar = {
   id: string;
@@ -25,6 +26,10 @@ export type RemoteCar = {
   netX: number;
   netY: number;
   netAngle: number;
+  /** Height in the air, eased toward the latest network height. */
+  z: number;
+  prevZ: number;
+  netZ: number;
 };
 
 /** Share of the gap to the network state closed each step: settles in about 80 ms. */
@@ -55,6 +60,9 @@ export function createRemoteCar(
     netX: info.x,
     netY: info.y,
     netAngle: info.angle,
+    z: info.z ?? 0,
+    prevZ: info.z ?? 0,
+    netZ: info.z ?? 0,
   };
 }
 
@@ -65,6 +73,7 @@ export function applyNetworkState(car: RemoteCar, state: NetworkCarState & { lig
   car.vx = state.vx;
   car.vy = state.vy;
   car.lights = state.lights;
+  car.netZ = state.z ?? 0;
 
   if (Math.hypot(car.x - state.x, car.y - state.y) > SNAP_DISTANCE) {
     car.x = car.prevX = state.x;
@@ -78,6 +87,7 @@ export function stepRemoteCar(car: RemoteCar) {
   car.prevX = car.x;
   car.prevY = car.y;
   car.prevAngle = car.angle;
+  car.prevZ = car.z;
 
   car.netX += car.vx;
   car.netY += car.vy;
@@ -86,6 +96,7 @@ export function stepRemoteCar(car: RemoteCar) {
   car.x += (car.netX - car.x) * CATCH_UP;
   car.y += (car.netY - car.y) * CATCH_UP;
   car.angle += wrapAngle(car.netAngle - car.angle) * CATCH_UP;
+  car.z += (car.netZ - car.z) * 0.35;
 }
 
 /** Where to draw the car `alpha` of the way from its previous step to its latest. */
@@ -94,5 +105,6 @@ export function remoteDrawState(car: RemoteCar, alpha: number) {
     x: lerp(car.prevX, car.x, alpha),
     y: lerp(car.prevY, car.y, alpha),
     angle: lerp(car.prevAngle, car.angle, alpha),
+    z: lerp(car.prevZ, car.z, alpha),
   };
 }

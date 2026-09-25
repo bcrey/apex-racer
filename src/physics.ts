@@ -51,8 +51,13 @@ export function getDistanceToTrack(p: Point) {
   return Math.sqrt(minDistSq);
 }
 
+/** True where the car has full grip: the circuit's tarmac, by default. */
+export type SurfaceTest = (p: Point) => boolean;
+
+export const isOnCircuit: SurfaceTest = (p) => getDistanceToTrack(p) < HALF_TRACK_WIDTH;
+
 /** Advances the car by one physics step. */
-export function stepCar(c: CarState, input: DriveInput): StepInfo {
+export function stepCar(c: CarState, input: DriveInput, isOnSurface: SurfaceTest = isOnCircuit): StepInfo {
   const steer = Math.sign(input.steer);
   const forwardX = Math.cos(c.angle);
   const forwardY = Math.sin(c.angle);
@@ -62,7 +67,7 @@ export function stepCar(c: CarState, input: DriveInput): StepInfo {
   const speed = c.vx * forwardX + c.vy * forwardY;
   const lateralSpeed = c.vx * rightX + c.vy * rightY;
 
-  const isOnTrack = getDistanceToTrack(c) < HALF_TRACK_WIDTH;
+  const isOnTrack = isOnSurface(c);
   const isDrifting = isOnTrack && input.brake && steer !== 0 && Math.abs(speed) > 2.5;
 
   const engineForce = isOnTrack ? 0.6 : 0.3;

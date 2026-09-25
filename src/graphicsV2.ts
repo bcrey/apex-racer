@@ -1,6 +1,7 @@
 // "V2" renderer. The classic look stays in App.tsx untouched; everything here
 // draws in world coordinates unless the function name says otherwise.
 import { shade } from './color';
+import { heightScale, type Ramp } from './stuntPark';
 import {
   getGridSlotPosition,
   HALF_TRACK_WIDTH,
@@ -398,15 +399,17 @@ export function drawCarV2(
   y: number,
   angle: number,
   color: string,
-  options: { steer?: number; braking?: boolean; lights?: number } = {},
+  options: { steer?: number; braking?: boolean; lights?: number; height?: number } = {},
 ) {
   const steer = options.steer ?? 0;
+  const height = options.height ?? 0;
 
-  // Shadow is cast down and to the right no matter which way the car faces
+  // Shadow is cast down and to the right no matter which way the car faces;
+  // a car in the air throws it further away and fainter
   ctx.save();
-  ctx.translate(x + 5, y + 7);
+  ctx.translate(x + 5 + height * 0.55, y + 7 + height * 0.75);
   ctx.rotate(angle);
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.32)';
+  ctx.fillStyle = `rgba(0, 0, 0, ${0.32 * Math.max(0.4, 1 - height / 320)})`;
   ctx.beginPath();
   ctx.roundRect(-CAR_HALF_LENGTH, -CAR_HALF_WIDTH, CAR_HALF_LENGTH * 2, CAR_HALF_WIDTH * 2, 9);
   ctx.fill();
@@ -415,6 +418,10 @@ export function drawCarV2(
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(angle);
+  if (height > 0) {
+    const scale = heightScale(height);
+    ctx.scale(scale, scale);
+  }
 
   // Tyres (fronts turn with steering input)
   ctx.fillStyle = '#0b0f19';
@@ -796,4 +803,138 @@ export function drawMinimap(
   ctx.closePath();
   ctx.fill();
   ctx.stroke();
+}
+
+// --- Stunt Park -------------------------------------------------------------
+
+const LOT_ROW = 700;
+const STALL_DEPTH = 200;
+const STALL_WIDTH = 110;
+
+/** Endless asphalt with rows of painted parking stalls, over the visible rectangle. */
+export function drawParkingLotV2(ctx: CanvasRenderingContext2D, left: number, top: number, right: number, bottom: number) {
+  ctx.fillStyle = getAsphaltPattern(ctx) ?? '#34363c';
+  ctx.fillRect(left, top, right - left, bottom - top);
+
+  // Each row: stalls facing up, a back line, stalls facing down, then an aisle
+  ctx.strokeStyle = 'rgba(248, 250, 252, 0.5)';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  for (let row = Math.floor(top / LOT_ROW) * LOT_ROW; row < bottom; row += LOT_ROW) {
+    ctx.moveTo(left, row + STALL_DEPTH);
+    ctx.lineTo(right, row + STALL_DEPTH);
+    for (let x = Math.floor(left / STALL_WIDTH) * STALL_WIDTH; x < right; x += STALL_WIDTH) {
+      ctx.moveTo(x, row);
+      ctx.lineTo(x, row + STALL_DEPTH * 2);
+    }
+  }
+  ctx.stroke();
+
+  // Faded yellow centre line down each aisle
+  ctx.strokeStyle = 'rgba(250, 204, 21, 0.35)';
+  ctx.lineWidth = 5;
+  ctx.setLineDash([60, 50]);
+  ctx.beginPath();
+  for (let row = Math.floor(top / LOT_ROW) * LOT_ROW; row < bottom; row += LOT_ROW) {
+    const aisle = row + STALL_DEPTH * 2 + (LOT_ROW - STALL_DEPTH * 2) / 2;
+    ctx.moveTo(left, aisle);
+    ctx.lineTo(right, aisle);
+  }
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawKickerV2(ctx: CanvasRenderingContext2D, ramp: Ramp) {
+  const { halfLength: hl, halfWidth: hw } = ramp;
+  ctx.save();
+  ctx.translate(ramp.x, ramp.y);
+  ctx.rotate(ramp.angle);
+
+  // Drop shadow past the lip sells the height
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+  ctx.beginPath();
+  ctx.moveTo(hl, -hw);
+  ctx.lineTo(hl + 46, -hw + 18);
+  ctx.lineTo(hl + 46, hw + 18);
+  ctx.lineTo(hl, hw);
+  ctx.closePath();
+  ctx.fill();
+
+  // Deck rises from dark at the foot to lit at the lip
+  const deck = ctx.createLinearGradient(-hl, 0, hl, 0);
+  deck.addColorStop(0, '#3b4150');
+  deck.addColorStop(1, '#a3adbd');
+  ctx.fillStyle = deck;
+  ctx.fillRect(-hl, -hw, hl * 2, hw * 2);
+
+  // Side rails
+  ctx.fillStyle = '#1f2430';
+  ctx.fillRect(-hl, -hw - 6, hl * 2, 8);
+  ctx.fillRect(-hl, hw - 2, hl * 2, 8);
+
+  // Chevrons pointing the way to go
+  ctx.strokeStyle = 'rgba(248, 250, 252, 0.55)';
+  ctx.lineWidth = 7;
+  ctx.lineJoin = 'miter';
+  for (const offset of [-hl * 0.55, -hl * 0.05]) {
+    ctx.beginPath();
+    ctx.moveTo(offset, -hw * 0.45);
+    ctx.lineTo(offset + 26, 0);
+    ctx.lineTo(offset, hw * 0.45);
+    ctx.stroke();
+  }
+
+  // Hazard stripes on the lip
+  const lip = 18;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(hl - lip, -hw, lip, hw * 2);
+  ctx.clip();
+  ctx.fillStyle = '#facc15';
+  ctx.fillRect(hl - lip, -hw, lip, hw * 2);
+  ctx.fillStyle = '#111827';
+  for (let v = -hw - lip; v < hw; v += 36) {
+    ctx.beginPath();
+    ctx.moveTo(hl - lip, v);
+    ctx.lineTo(hl, v + lip);
+    ctx.lineTo(hl, v + lip + 16);
+    ctx.lineTo(hl - lip, v + 16);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function drawBumpV2(ctx: CanvasRenderingContext2D, ramp: Ramp) {
+  const r = ramp.halfWidth;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+  ctx.beginPath();
+  ctx.ellipse(ramp.x + 14, ramp.y + 18, r, r, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Lit from the top left like everything else
+  const mound = ctx.createRadialGradient(ramp.x - r * 0.35, ramp.y - r * 0.35, r * 0.1, ramp.x, ramp.y, r);
+  mound.addColorStop(0, '#b4bcc9');
+  mound.addColorStop(0.6, '#646c7b');
+  mound.addColorStop(1, '#343944');
+  ctx.fillStyle = mound;
+  ctx.beginPath();
+  ctx.arc(ramp.x, ramp.y, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = 'rgba(250, 204, 21, 0.85)';
+  ctx.lineWidth = 8;
+  ctx.setLineDash([22, 18]);
+  ctx.beginPath();
+  ctx.arc(ramp.x, ramp.y, r * 0.78, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+export function drawRampsV2(ctx: CanvasRenderingContext2D, ramps: Ramp[]) {
+  for (const ramp of ramps) {
+    if (ramp.kind === 'kicker') drawKickerV2(ctx, ramp);
+    else drawBumpV2(ctx, ramp);
+  }
 }

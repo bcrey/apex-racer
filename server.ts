@@ -35,6 +35,9 @@ type Player = {
   vy: number;
   color: string;
   lights?: boolean;
+  z?: number;
+  /** Players only see others on the same level. */
+  level: string;
 };
 
 function queryTimeZone(value: unknown) {
@@ -150,10 +153,13 @@ async function startServer() {
   const wss = new WebSocketServer({ server });
   const players = new Map<string, Player>();
 
-  const broadcast = (message: object, except?: WebSocket) => {
+  const clientLevels = new WeakMap<WebSocket, string>();
+
+  /** Sends to every open client, or only those on `level` when given. */
+  const broadcast = (message: object, except?: WebSocket, level?: string) => {
     const payload = JSON.stringify(message);
     wss.clients.forEach((client) => {
-      if (client !== except && client.readyState === WebSocket.OPEN) {
+      if (client !== except && client.readyState === WebSocket.OPEN && (!level || clientLevels.get(client) === level)) {
         client.send(payload);
       }
     });
@@ -164,11 +170,14 @@ async function startServer() {
     const id = Math.random().toString(36).substring(2, 9);
     const requestUrl = new URL(req.url ?? '/', 'http://localhost');
     const initials = sanitizeInitials(requestUrl.searchParams.get('initials'));
+    const level = requestUrl.searchParams.get('level') === 'stunt' ? 'stunt' : 'circuit';
+    clientLevels.set(ws, level);
+    const levelPlayers = () => Array.from(players.values()).filter((other) => other.level === level);
 
     const { slotIndex, color, x, y } = getGridPlacement(
-      getFirstOpenSlot(Array.from(players.values(), (player) => player.slotIndex)),
+      getFirstOpenSlot(levelPlayers().map((other) => other.slotIndex)),
     );
-    const player: Player = { id, slotIndex, initials, x, y, angle: 0, vx: 0, vy: 0, color };
+    const player: Player = { id, slotIndex, initials, x, y, angle: 0, vx: 0, vy: 0, color, level };
     players.set(id, player);
 
     ws.send(JSON.stringify({
@@ -178,10 +187,10 @@ async function startServer() {
       initials,
       x,
       y,
-      players: Array.from(players.values()),
+      players: levelPlayers(),
     }));
 
-    broadcast({ type: 'join', player }, ws);
+    broadcast({ type: 'join', player }, ws, level);
 
     ws.on('message', (data) => {
       try {
@@ -193,6 +202,7 @@ async function startServer() {
           vx?: number;
           vy?: number;
           lights?: boolean;
+          z?: number;
         };
 
         if (msg.type !== 'update') {
@@ -205,6 +215,7 @@ async function startServer() {
         player.vx = msg.vx ?? player.vx;
         player.vy = msg.vy ?? player.vy;
         player.lights = msg.lights ?? player.lights;
+        player.z = msg.z ?? 0;
 
         broadcast({
           type: 'update',
@@ -215,7 +226,8 @@ async function startServer() {
           vx: player.vx,
           vy: player.vy,
           lights: player.lights,
-        }, ws);
+          z: player.z,
+        }, ws, level);
       } catch (error) {
         console.error('Message error', error);
       }
@@ -223,7 +235,7 @@ async function startServer() {
 
     ws.on('close', () => {
       players.delete(id);
-      broadcast({ type: 'leave', id });
+      broadcast({ type: 'leave', id }, undefined, level);
     });
   });
 }

@@ -136,6 +136,43 @@ export class RaceSound {
     this.tone(196, 0.3, 'sawtooth', 0.12);
   }
 
+  /** A quick rising whoosh as the car leaves a ramp. */
+  jump() {
+    const { ctx, nodes } = this;
+    if (!ctx || !nodes) return;
+    const now = ctx.currentTime;
+    const osc = ctx.createOscillator();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(220, now);
+    osc.frequency.exponentialRampToValueAtTime(660, now + 0.25);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.12, now + 0.03);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+    osc.connect(gain).connect(nodes.master);
+    osc.start(now);
+    osc.stop(now + 0.35);
+  }
+
+  /** A thump on touchdown; `strength` 0..1 from how hard the car came down. */
+  land(strength: number) {
+    const { ctx, nodes, noise } = this;
+    if (!ctx || !nodes || !noise) return;
+    const now = ctx.currentTime;
+    const source = ctx.createBufferSource();
+    source.buffer = noise;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(420, now);
+    filter.frequency.exponentialRampToValueAtTime(60, now + 0.25);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0.25 + 0.5 * Math.min(1, Math.max(0, strength)), now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+    source.connect(filter).connect(gain).connect(nodes.master);
+    source.start(now);
+    source.stop(now + 0.35);
+  }
+
   crash() {
     const { ctx, nodes, noise } = this;
     if (!ctx || !nodes || !noise) return;

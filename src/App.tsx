@@ -27,6 +27,8 @@ import SpeedGauge from './SpeedGauge';
 import {
   drawCarV2,
   drawGrassV2,
+  drawParkingLotV2,
+  drawRampsV2,
   drawLightLayerV2,
   drawMinimap,
   drawSkidMarksV2,
@@ -82,6 +84,15 @@ import {
   type RemoteCar,
 } from './remote';
 import { RaceSound } from './sound';
+import {
+  createAirState,
+  heightScale,
+  isAirborne,
+  rampsInRect,
+  stepStuntCar,
+  type Ramp,
+  type StuntEvent,
+} from './stuntPark';
 
 const DEFAULT_START = getGridSlotPosition(0);
 
@@ -125,7 +136,17 @@ type ExplosionParticle = {
 };
 
 /** A short message under the top of the screen: a split gap or a lap that did not count. */
-type LapFlash = { id: number; text: string; tone: 'ahead' | 'behind' | 'warn' };
+type LapFlash = { id: number; text: string; tone: 'ahead' | 'behind' | 'warn' | 'trick' };
+
+type LevelId = 'circuit' | 'stunt';
+const LEVELS: { id: LevelId; name: string; blurb: string }[] = [
+  { id: 'circuit', name: 'Circuit', blurb: 'Timed laps and the leaderboard' },
+  { id: 'stunt', name: 'Stunt Park', blurb: 'An endless lot full of jumps' },
+];
+
+/** What you have done in Stunt Park this session. */
+type StuntStats = { jumps: number; lastAirMs: number | null; bestAirMs: number | null; bestSpinDeg: number };
+const EMPTY_STUNT_STATS: StuntStats = { jumps: 0, lastAirMs: null, bestAirMs: null, bestSpinDeg: 0 };
 
 // Touch screens and short or narrow windows start with the small HUD, so the
 // full panel never covers the on-screen driving controls
@@ -144,6 +165,7 @@ const PODIUM_CONFETTI_COLORS = [
 const EXPLOSION_COLORS = ['#ffffff', '#fde047', '#fb7185', '#f97316', '#ef4444'] as const;
 const EASTER_EGG_INITIALS = 'SLY';
 const GRAPHICS_MODE_STORAGE_KEY = 'apex-racer:graphics';
+const LEVEL_STORAGE_KEY = 'apex-racer:level';
 const ADMIN_TOKEN_STORAGE_KEY = 'apex-racer:admin-token';
 const HUD_UPDATE_INTERVAL_MS = 33;
 const LAP_FLASH_MS = 2500;
@@ -167,6 +189,20 @@ function readDriveInput(held: Record<string, boolean>): DriveInput {
     brake: Boolean(held.KeyS || held.ArrowDown || held.Space || held.TouchBrake),
     steer: (right ? 1 : 0) - (left ? 1 : 0),
   };
+}
+
+function loadLevel(): LevelId {
+  try {
+    return window.localStorage.getItem(LEVEL_STORAGE_KEY) === 'stunt' ? 'stunt' : 'circuit';
+  } catch {
+    return 'circuit';
+  }
+}
+
+/** Spin in whole half-turns, as a trick name: 360, 540, 720... Null under a full turn. */
+function spinTrickName(spin: number) {
+  const halfTurns = Math.round(Math.abs(spin) / Math.PI);
+  return halfTurns >= 2 ? `${halfTurns * 180}!` : null;
 }
 
 function loadGraphicsMode(): GraphicsMode {
@@ -556,6 +592,8 @@ export default function App() {
   const headlightsOnRef = useRef(headlightsOn);
   const [sound] = useState(() => new RaceSound());
   const [muted, setMuted] = useState(sound.muted);
+  const [level, setLevel] = useState<LevelId>(loadLevel);
+  const [stuntStats, setStuntStats] = useState<StuntStats>(EMPTY_STUNT_STATS);
 
   // --- Multiplayer State ---
   const multiplayerRef = useRef<MultiplayerConnection | null>(null);
@@ -625,6 +663,14 @@ export default function App() {
   useEffect(() => {
     headlightsOnRef.current = headlightsOn;
   }, [headlightsOn]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(LEVEL_STORAGE_KEY, level);
+    } catch {
+      // Blocked storage: the choice just won't persist
+    }
+  }, [level]);
 
   useEffect(() => {
     graphicsModeRef.current = graphicsMode;
@@ -708,10 +754,13 @@ export default function App() {
       }
     };
 
+    const isStunt = level === 'stunt';
     const c = car.current;
     Object.assign(c, { x: DEFAULT_START.x, y: DEFAULT_START.y, vx: 0, vy: 0, angle: 0 });
     // Where the car was one physics step ago, to draw it between steps
-    const prevCar = { x: c.x, y: c.y, angle: c.angle };
+    const prevCar = { x: c.x, y: c.y, angle: c.angle, z: 0 };
+    // Height and jump state in Stunt Park; stays on the ground on the circuit
+    let air = createAirState();
     myColorRef.current = '#06b6d4';
     myIdRef.current = 'local';
     remotePlayers.current.clear();
@@ -725,6 +774,8 @@ export default function App() {
     setLapReadyToFinish(false);
     setLapCelebrationMessage(null);
     setLapFlash(null);
+    setCountdown(null);
+    setStuntStats(EMPTY_STUNT_STATS);
     // The WebSocket multiplayer server only exists in `npm run dev`
     const hasLocalServer = import.meta.env.DEV;
     multiplayerRef.current = null;
@@ -733,7 +784,7 @@ export default function App() {
     // since joining; lap times are measured in steps, not wall-clock time.
     let tick = 0;
     let lapState = createLapState();
-    let ghost: GhostLap | null = loadBestLap(playerInitials);
+    let ghost: GhostLap | null = isStunt ? null : loadBestLap(playerInitials);
     let recording: GhostRecording | null = null;
     let lapToken: Promise<string | null> | null = null;
     let flashCount = 0;
@@ -754,7 +805,8 @@ export default function App() {
     /** Puts the car on a grid slot (the server or presence assigns one); the lap starts over. */
     const placeCar = (x: number, y: number) => {
       Object.assign(c, { x, y, vx: 0, vy: 0, angle: 0 });
-      Object.assign(prevCar, { x, y, angle: 0 });
+      Object.assign(prevCar, { x, y, angle: 0, z: 0 });
+      air = createAirState();
       lapState = createLapState();
       recording = null;
       lapToken = null;
@@ -783,7 +835,7 @@ export default function App() {
 
     const setupLocalWebSocketConnection = () => {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}`;
+      const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}&level=${level}`;
       const ws = new WebSocket(wsUrl);
 
       ws.onmessage = (event) => {
@@ -836,7 +888,8 @@ export default function App() {
       }
 
       const playerId = crypto.randomUUID();
-      const channel = supabase.channel('apex-racer-room', {
+      // One room per level, so circuit racers and stunt drivers never overlap
+      const channel = supabase.channel(isStunt ? 'apex-racer-stunt' : 'apex-racer-room', {
         config: {
           broadcast: { self: false },
           presence: { key: playerId },
@@ -1035,7 +1088,9 @@ export default function App() {
     let isRutting = false;
 
     // Shows 3, 2, 1, then GO! as the countdown steps pass, with a beep for each
+    const countdownSteps = isStunt ? 0 : COUNTDOWN_STEPS;
     const updateCountdown = () => {
+      if (isStunt) return;
       const remaining = COUNTDOWN_STEPS - tick;
       const value = remaining > 0
         ? String(Math.ceil(remaining / PHYSICS_HZ))
@@ -1127,6 +1182,35 @@ export default function App() {
       }
     };
 
+    const handleStuntEvent = (event: StuntEvent) => {
+      if (event.type === 'launch') {
+        sound.jump();
+        return;
+      }
+
+      sound.land(event.impact / 12);
+      // A puff of dust where the tyres hit
+      for (let i = 0; i < 6; i++) {
+        spawnSmoke(smokeParticles.current, c.x, c.y, c.vx * 0.3, c.vy * 0.3);
+      }
+
+      const airMs = ticksToMs(event.airTicks);
+      const trick = spinTrickName(event.spin);
+      const spinDeg = Math.round(Math.abs(event.spin) / Math.PI) * 180;
+      setStuntStats((stats) => ({
+        jumps: stats.jumps + 1,
+        lastAirMs: airMs,
+        bestAirMs: Math.max(stats.bestAirMs ?? 0, airMs),
+        bestSpinDeg: trick ? Math.max(stats.bestSpinDeg, spinDeg) : stats.bestSpinDeg,
+      }));
+      const airText = `${(airMs / 1000).toFixed(1)}s`;
+      if (trick) {
+        flash(`${trick} ${airText}`, 'trick');
+      } else if (airMs >= 900) {
+        flash(`Big air ${airText}`, 'trick');
+      }
+    };
+
     const updateExplosion = () => {
       const particles = explosionParticles.current;
       for (let i = particles.length - 1; i >= 0; i--) {
@@ -1164,9 +1248,17 @@ export default function App() {
       prevCar.y = c.y;
       prevCar.angle = c.angle;
 
-      const racing = tick >= COUNTDOWN_STEPS && !isDestroyedRef.current;
+      const racing = tick >= countdownSteps && !isDestroyedRef.current;
       const input = racing ? liveInput : NO_INPUT;
-      const step = stepCar(c, input);
+      prevCar.z = air.z;
+      let step: StepInfo;
+      if (isStunt) {
+        const result = stepStuntCar(c, air, input);
+        step = result.step;
+        if (result.event) handleStuntEvent(result.event);
+      } else {
+        step = stepCar(c, input);
+      }
       tick++;
       lastStep = step;
       lastInput = input;
@@ -1174,7 +1266,7 @@ export default function App() {
 
       // Tyre effects are always simulated; each renderer picks what to draw
       const groundSpeed = Math.hypot(c.vx, c.vy);
-      isSkidding = Math.abs(step.lateralSpeed) > (step.isDrifting ? 1.5 : 3) && step.isOnTrack;
+      isSkidding = Math.abs(step.lateralSpeed) > (step.isDrifting ? 1.5 : 3) && step.isOnTrack && !isAirborne(air);
       isRutting = !step.isOnTrack && groundSpeed > 2;
       const rearWheels = [-11, 11].map(side => ({
         x: c.x + step.rightX * side - step.forwardX * 16,
@@ -1219,7 +1311,7 @@ export default function App() {
       updateConfetti();
       remotePlayers.current.forEach(stepRemoteCar);
 
-      const event = updateLap(lapState, prevCar, c, tick);
+      const event = isStunt ? null : updateLap(lapState, prevCar, c, tick);
       if (event) {
         handleLapEvent(event);
       }
@@ -1248,6 +1340,7 @@ export default function App() {
         x: lerp(prevCar.x, c.x, alpha),
         y: lerp(prevCar.y, c.y, alpha),
         angle: lerp(prevCar.angle, c.angle, alpha),
+        z: lerp(prevCar.z, air.z, alpha),
       };
 
       // --- Multiplayer Send ---
@@ -1260,6 +1353,7 @@ export default function App() {
           vx: c.vx,
           vy: c.vy,
           lights: headlightsOnRef.current,
+          z: isStunt ? Math.round(air.z) : undefined,
         });
         lastSendTime.current = time;
       }
@@ -1297,7 +1391,9 @@ export default function App() {
       // --- Rendering ---
       if (graphicsModeRef.current === 'v2') {
         const speedRatio = Math.min(1, groundSpeed / V2_TOP_SPEED);
-        const targetZoom = (V2_ZOOM + (V2_ZOOM_AT_SPEED - V2_ZOOM) * speedRatio) * getViewportZoomScale(viewWidth, viewHeight);
+        // Pull back a little while airborne so the landing stays in view
+        const airPullBack = 1 - Math.min(0.2, pose.z / 900);
+        const targetZoom = (V2_ZOOM + (V2_ZOOM_AT_SPEED - V2_ZOOM) * speedRatio) * getViewportZoomScale(viewWidth, viewHeight) * airPullBack;
         zoom += (targetZoom - zoom) * easeForFrame(0.05, frameMs);
         renderV2(isDestroyed, lastInput, pose, ghostPose, alpha);
       } else {
@@ -1308,7 +1404,7 @@ export default function App() {
       animationId = requestAnimationFrame(loop);
     };
 
-    type Pose = { x: number; y: number; angle: number };
+    type Pose = { x: number; y: number; angle: number; z?: number };
 
     // Draws the world in V2 style around the camera focus, then screen overlays.
     const renderV2 = (isDestroyed: boolean, input: DriveInput, pose: Pose, ghostPose: Pose | null, alpha: number) => {
@@ -1324,8 +1420,13 @@ export default function App() {
       ctx.scale(zoom, zoom);
       ctx.translate(-focusX, -focusY);
 
-      drawGrassV2(ctx, focusX - halfW, focusY - halfH, focusX + halfW, focusY + halfH);
-      drawTrackV2(ctx);
+      if (isStunt) {
+        drawParkingLotV2(ctx, focusX - halfW, focusY - halfH, focusX + halfW, focusY + halfH);
+        drawRampsV2(ctx, visibleRamps(focusX - halfW, focusY - halfH, focusX + halfW, focusY + halfH));
+      } else {
+        drawGrassV2(ctx, focusX - halfW, focusY - halfH, focusX + halfW, focusY + halfH);
+        drawTrackV2(ctx);
+      }
       drawSkidMarksV2(ctx, skidMarks.current);
       drawSmoke(ctx, smokeParticles.current);
       drawGrass(ctx, grassParticles.current);
@@ -1340,14 +1441,16 @@ export default function App() {
       const localLights = headlightsOnRef.current && !isDestroyed ? 1 : 0;
       const remotes = Array.from(remotePlayers.current.values(), (player: RemoteCar) => ({ player, ...remoteDrawState(player, alpha) }));
 
-      remotes.forEach(({ player, x, y, angle }) => {
-        drawCarV2(ctx, x, y, angle, player.color, { lights: remoteLightStrength(player) });
+      remotes.forEach(({ player, x, y, angle, z }) => {
+        drawCarV2(ctx, x, y, angle, player.color, { lights: remoteLightStrength(player), height: z });
       });
 
       drawExplosion();
 
       if (!isDestroyed) {
-        drawCarV2(ctx, pose.x, pose.y, pose.angle, myColorRef.current, { steer: input.steer, braking: input.brake, lights: localLights });
+        drawCarV2(ctx, pose.x, pose.y, pose.angle, myColorRef.current, {
+          steer: input.steer, braking: input.brake, lights: localLights, height: pose.z,
+        });
       }
 
       // Headlights go on after the cars so they light up any bodywork they hit,
@@ -1389,7 +1492,7 @@ export default function App() {
       drawConfetti();
 
       const minimap = minimapRef.current;
-      if (minimap) {
+      if (minimap && !isStunt) {
         drawMinimap(
           minimap,
           { ...pose, color: myColorRef.current },
@@ -1434,9 +1537,97 @@ export default function App() {
       }
     };
 
+    /** Ramps whose cells touch the view, padded so a ramp's lip and shadow never pop in. */
+    const visibleRamps = (left: number, top: number, right: number, bottom: number): Ramp[] =>
+      rampsInRect(left - 300, top - 300, right + 300, bottom + 300);
+
+    /** The Stunt Park lot in the original flat style. */
+    const drawClassicLot = (left: number, top: number, right: number, bottom: number) => {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(left, top, right - left, bottom - top);
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      for (let row = Math.floor(top / 700) * 700; row < bottom; row += 700) {
+        ctx.moveTo(left, row + 200);
+        ctx.lineTo(right, row + 200);
+        for (let x = Math.floor(left / 110) * 110; x < right; x += 110) {
+          ctx.moveTo(x, row);
+          ctx.lineTo(x, row + 400);
+        }
+      }
+      ctx.stroke();
+
+      for (const ramp of visibleRamps(left, top, right, bottom)) {
+        if (ramp.kind === 'bump') {
+          ctx.fillStyle = '#f59e0b';
+          ctx.beginPath();
+          ctx.arc(ramp.x, ramp.y, ramp.halfWidth, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.strokeStyle = '#000';
+          ctx.lineWidth = 6;
+          ctx.stroke();
+          continue;
+        }
+        ctx.save();
+        ctx.translate(ramp.x, ramp.y);
+        ctx.rotate(ramp.angle);
+        ctx.fillStyle = '#f59e0b';
+        ctx.fillRect(-ramp.halfLength, -ramp.halfWidth, ramp.halfLength * 2, ramp.halfWidth * 2);
+        ctx.fillStyle = '#000';
+        ctx.fillRect(ramp.halfLength - 16, -ramp.halfWidth, 16, ramp.halfWidth * 2);
+        ctx.restore();
+      }
+    };
+
+    /** The original car, lifted off its shadow and drawn larger when it is in the air. */
+    const drawClassicCar = (x: number, y: number, angle: number, color: string, lights: boolean, z = 0) => {
+      if (z <= 0) {
+        drawCar(ctx, x, y, angle, color, lights);
+        return;
+      }
+      ctx.save();
+      ctx.translate(x + z * 0.55, y + z * 0.75);
+      ctx.rotate(angle);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+      ctx.beginPath();
+      ctx.roundRect(-24, -14, 48, 28, 6);
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      ctx.translate(x, y);
+      const scale = heightScale(z);
+      ctx.scale(scale, scale);
+      drawCar(ctx, 0, 0, angle, color, lights);
+      ctx.restore();
+    };
+
     // V1 is the original look: no ghost car and no sound
     const renderClassic = (isDestroyed: boolean, pose: Pose, alpha: number) => {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
+
+      if (isStunt) {
+        ctx.save();
+        ctx.translate(cameraX, cameraY);
+        drawClassicLot(-cameraX, -cameraY, -cameraX + viewWidth, -cameraY + viewHeight);
+        skidMarks.current.forEach(mark => {
+          ctx.fillStyle = `rgba(0, 0, 0, ${mark.life * 0.4})`;
+          ctx.beginPath();
+          ctx.arc(mark.x, mark.y, 5, 0, Math.PI * 2);
+          ctx.fill();
+        });
+        remotePlayers.current.forEach(p => {
+          const { x, y, angle, z } = remoteDrawState(p, alpha);
+          drawClassicCar(x, y, angle, p.color, false, z);
+          drawDriverTag(ctx, x, y, p.initials, p.color);
+        });
+        if (!isDestroyed) {
+          drawClassicCar(pose.x, pose.y, pose.angle, myColorRef.current, headlightsOnRef.current, pose.z);
+        }
+        ctx.restore();
+        return;
+      }
 
       ctx.fillStyle = '#166534'; // Grass
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1539,7 +1730,7 @@ export default function App() {
       window.removeEventListener('blur', clearHeldKeys);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [playerInitials]);
+  }, [playerInitials, level]);
 
   const handleJoin = (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -1673,19 +1864,31 @@ export default function App() {
       )}
     </button>
   );
+  const isStunt = level === 'stunt';
   const compactHud = (
     <div className="pointer-events-auto flex items-center gap-3 rounded-2xl border border-white/10 bg-black/70 px-3 py-3 text-white shadow-xl backdrop-blur-md">
       {hudToggleButton}
 
-      <div className="min-w-0">
-        <div className="text-[10px] font-semibold uppercase tracking-[0.35em] text-white/45">
-          Lap {lap}
+      {isStunt ? (
+        <div className="min-w-0">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.35em] text-white/45">
+            Stunt Park
+          </div>
+          <div className="mt-1 font-mono text-lg font-bold text-yellow-400">
+            {stuntStats.jumps} {stuntStats.jumps === 1 ? 'jump' : 'jumps'}
+          </div>
         </div>
-        <div className="mt-1 flex items-center gap-2 font-mono">
-          <span className="text-lg font-bold text-yellow-400">{currentLapDisplay}</span>
-          {currentLapMedalBadge}
+      ) : (
+        <div className="min-w-0">
+          <div className="text-[10px] font-semibold uppercase tracking-[0.35em] text-white/45">
+            Lap {lap}
+          </div>
+          <div className="mt-1 flex items-center gap-2 font-mono">
+            <span className="text-lg font-bold text-yellow-400">{currentLapDisplay}</span>
+            {currentLapMedalBadge}
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 
@@ -1718,6 +1921,62 @@ export default function App() {
           </button>
         ))}
       </div>
+    </div>
+  );
+
+  const levelToggle = (
+    <div className="mb-4 flex items-center justify-between gap-3">
+      <span id="level-label" className="text-xs uppercase tracking-widest text-gray-400">Level</span>
+      <div
+        aria-labelledby="level-label"
+        className="pointer-events-auto relative grid w-36 grid-cols-2 rounded-full border border-white/10 bg-white/5 p-1"
+        role="radiogroup"
+      >
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-full bg-gradient-to-r from-sky-500 to-cyan-400 shadow-lg transition-transform duration-300 ease-out"
+          style={{ transform: isStunt ? 'translateX(100%)' : 'translateX(0)' }}
+        />
+        {LEVELS.map(({ id, name }) => (
+          <button
+            aria-checked={level === id}
+            className={`relative z-10 rounded-full py-1 text-[10px] font-bold uppercase tracking-[0.08em] transition-colors ${
+              level === id ? 'text-white' : 'text-white/50 hover:text-white/80'
+            }`}
+            key={id}
+            onClick={() => setLevel(id)}
+            role="radio"
+            type="button"
+          >
+            {id === 'stunt' ? 'Stunt' : name}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderStatRow = (label: string, value: string | null, colorClass: string) => (
+    <div className="flex items-center justify-between gap-4 sm:gap-6">
+      <span className="text-xs uppercase tracking-widest text-gray-400">{label}</span>
+      <span className={`text-base font-bold sm:text-lg ${value === null ? 'text-white/30' : colorClass}`}>
+        {value ?? '--'}
+      </span>
+    </div>
+  );
+  const formatAir = (ms: number | null) => (ms === null ? null : `${(ms / 1000).toFixed(1)}s`);
+
+  const stuntDetails = (
+    <div className="space-y-2 font-mono">
+      <div className="flex items-center justify-between gap-4 sm:gap-6">
+        <span className="text-xs uppercase tracking-widest text-gray-400">Jumps</span>
+        <span className="text-lg font-bold text-yellow-400 sm:text-xl">{stuntStats.jumps}</span>
+      </div>
+      {renderStatRow('Last air', formatAir(stuntStats.lastAirMs), 'text-cyan-100')}
+      {renderStatRow('Best air', formatAir(stuntStats.bestAirMs), 'text-green-400')}
+      {renderStatRow('Best spin', stuntStats.bestSpinDeg ? `${stuntStats.bestSpinDeg}°` : null, 'text-orange-300')}
+      <p className="border-t border-white/10 pt-3 font-sans text-xs leading-relaxed text-gray-400">
+        Hit the ramps with speed. Steer in the air to spin.
+      </p>
     </div>
   );
 
@@ -1762,9 +2021,11 @@ export default function App() {
         APEX RACER
       </h1>
       <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive, L for lights{isV2 && ', M for sound'}</p>
+      {levelToggle}
       {graphicsToggle}
       {isV2 && soundToggle}
 
+      {isStunt ? stuntDetails : (
       <div className="space-y-2 font-mono">
         <div className="flex items-center justify-between gap-4 sm:gap-6">
           <span className="text-xs uppercase tracking-widest text-gray-400">Lap</span>
@@ -1805,10 +2066,13 @@ export default function App() {
           )}
         </div>
       </div>
+      )}
     </>
   );
 
-  const lapFlashClass = lapFlash?.tone === 'ahead'
+  const lapFlashClass = lapFlash?.tone === 'trick'
+    ? 'border-amber-200/40 bg-gradient-to-r from-orange-500/90 to-rose-500/90 text-lg uppercase italic tracking-wide'
+    : lapFlash?.tone === 'ahead'
     ? 'border-emerald-200/40 bg-emerald-500/85 font-mono text-lg tabular-nums'
     : lapFlash?.tone === 'behind'
       ? 'border-rose-200/40 bg-rose-500/85 font-mono text-lg tabular-nums'
@@ -1880,7 +2144,7 @@ export default function App() {
       {isV2 ? (
         <div className="pointer-events-none absolute top-[max(1rem,env(safe-area-inset-top))] right-[max(1rem,env(safe-area-inset-right))] flex flex-col items-end gap-3 sm:top-[max(1.5rem,env(safe-area-inset-top))] sm:right-[max(1.5rem,env(safe-area-inset-right))]">
           <SpeedGauge mph={speedMph} />
-          <canvas
+          {!isStunt && <canvas
             aria-label="Track map"
             // Height leaves room for the gauge above and the gas/headlight stack
             // below; width follows from the aspect ratio. Hidden on very short screens.
@@ -1888,7 +2152,7 @@ export default function App() {
             ref={minimapRef}
             role="img"
             style={{ aspectRatio: MINIMAP_ASPECT }}
-          />
+          />}
         </div>
       ) : (
         <div className="absolute top-6 right-6 bg-black/60 text-white p-6 rounded-3xl backdrop-blur-md border border-white/10 shadow-xl flex flex-col items-end pointer-events-none">
@@ -1968,6 +2232,28 @@ export default function App() {
               spellCheck={false}
               value={initialsInput}
             />
+
+            <fieldset className="mt-5">
+              <legend className="text-xs font-bold uppercase tracking-[0.3em] text-slate-400">Level</legend>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                {LEVELS.map(({ id, name, blurb }) => (
+                  <button
+                    aria-pressed={level === id}
+                    className={`rounded-2xl border px-3 py-3 text-left transition ${
+                      level === id
+                        ? 'border-cyan-400 bg-cyan-400/10 text-white'
+                        : 'border-white/10 bg-slate-900/60 text-slate-300 hover:border-white/25'
+                    }`}
+                    key={id}
+                    onClick={() => setLevel(id)}
+                    type="button"
+                  >
+                    <span className="block text-sm font-black italic">{name}</span>
+                    <span className="mt-1 block text-[11px] leading-snug text-slate-400">{blurb}</span>
+                  </button>
+                ))}
+              </div>
+            </fieldset>
 
             <button
               className="mt-5 w-full rounded-2xl bg-gradient-to-r from-rose-500 to-orange-400 px-4 py-3 text-sm font-black uppercase tracking-[0.3em] text-white disabled:cursor-not-allowed disabled:opacity-40"
