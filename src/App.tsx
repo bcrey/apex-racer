@@ -628,6 +628,7 @@ export default function App() {
 
   useEffect(() => {
     graphicsModeRef.current = graphicsMode;
+    sound.setEnabled(graphicsMode === 'v2');
     resizeCanvasRef.current?.();
     try {
       window.localStorage.setItem(GRAPHICS_MODE_STORAGE_KEY, graphicsMode);
@@ -962,7 +963,7 @@ export default function App() {
       if (!e.repeat) {
         const key = e.key.toLowerCase();
         if (key === 'l') setHeadlightsOn((on) => !on);
-        if (key === 'm') toggleMute();
+        if (key === 'm' && graphicsModeRef.current === 'v2') toggleMute();
       }
       if (DRIVING_KEYS.has(e.code)) {
         // Also stops Space and the arrows from pressing a focused HUD button
@@ -1301,7 +1302,7 @@ export default function App() {
         renderV2(isDestroyed, lastInput, pose, ghostPose, alpha);
       } else {
         zoom = 1;
-        renderClassic(isDestroyed, pose, ghostPose, alpha);
+        renderClassic(isDestroyed, pose, alpha);
       }
 
       animationId = requestAnimationFrame(loop);
@@ -1433,7 +1434,8 @@ export default function App() {
       }
     };
 
-    const renderClassic = (isDestroyed: boolean, pose: Pose, ghostPose: Pose | null, alpha: number) => {
+    // V1 is the original look: no ghost car and no sound
+    const renderClassic = (isDestroyed: boolean, pose: Pose, alpha: number) => {
       ctx.setTransform(1, 0, 0, 1, 0, 0);
 
       ctx.fillStyle = '#166534'; // Grass
@@ -1503,13 +1505,6 @@ export default function App() {
         ctx.arc(mark.x, mark.y, 5, 0, Math.PI * 2);
         ctx.fill();
       });
-
-      if (ghostPose) {
-        ctx.save();
-        ctx.globalAlpha = GHOST_ALPHA;
-        drawCar(ctx, ghostPose.x, ghostPose.y, ghostPose.angle, GHOST_COLOR, false);
-        ctx.restore();
-      }
 
       // Remote Cars
       remotePlayers.current.forEach(p => {
@@ -1766,9 +1761,9 @@ export default function App() {
       <h1 className="mb-1 bg-gradient-to-r from-rose-400 to-orange-400 bg-clip-text text-xl font-black italic tracking-wider text-transparent sm:text-2xl">
         APEX RACER
       </h1>
-      <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive, L for lights, M for sound</p>
+      <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive, L for lights{isV2 && ', M for sound'}</p>
       {graphicsToggle}
-      {soundToggle}
+      {isV2 && soundToggle}
 
       <div className="space-y-2 font-mono">
         <div className="flex items-center justify-between gap-4 sm:gap-6">

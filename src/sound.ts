@@ -42,6 +42,8 @@ type Nodes = {
 
 export class RaceSound {
   muted = loadMuted();
+  /** False silences everything without touching the saved mute choice (V1 has no sound). */
+  private enabled = true;
   private ctx: AudioContext | null = null;
   private nodes: Nodes | null = null;
   private noise: AudioBuffer | null = null;
@@ -70,8 +72,21 @@ export class RaceSound {
     } catch {
       // Blocked storage: the choice just won't persist
     }
+    this.applyVolume();
+  }
+
+  setEnabled(enabled: boolean) {
+    this.enabled = enabled;
+    this.applyVolume();
+  }
+
+  private get volume() {
+    return this.enabled && !this.muted ? MASTER_VOLUME : 0;
+  }
+
+  private applyVolume() {
     if (this.ctx && this.nodes) {
-      this.nodes.master.gain.setTargetAtTime(muted ? 0 : MASTER_VOLUME, this.ctx.currentTime, 0.03);
+      this.nodes.master.gain.setTargetAtTime(this.volume, this.ctx.currentTime, 0.03);
     }
   }
 
@@ -156,7 +171,7 @@ export class RaceSound {
 
   private build(ctx: AudioContext) {
     const master = ctx.createGain();
-    master.gain.value = this.muted ? 0 : MASTER_VOLUME;
+    master.gain.value = this.volume;
     master.connect(ctx.destination);
 
     // Two seconds of white noise, looped, feeds the squeal and the rumble
