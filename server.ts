@@ -14,7 +14,7 @@ import {
   resetLeaderboardData,
   sanitizeInitials,
 } from './lib/leaderboard';
-import { getFirstOpenSlot, getGridPlacement } from './src/track';
+import { getFirstOpenSlot, getGridPlacement, isPlayerColor, pickFreeColor } from './src/track';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -174,9 +174,10 @@ async function startServer() {
     clientLevels.set(ws, level);
     const levelPlayers = () => Array.from(players.values()).filter((other) => other.level === level);
 
-    const { slotIndex, color, x, y } = getGridPlacement(
+    const { slotIndex, x, y } = getGridPlacement(
       getFirstOpenSlot(levelPlayers().map((other) => other.slotIndex)),
     );
+    const color = pickFreeColor(levelPlayers().map((other) => other.color), requestUrl.searchParams.get('color'));
     const player: Player = { id, slotIndex, initials, x, y, angle: 0, vx: 0, vy: 0, color, level };
     players.set(id, player);
 
@@ -203,7 +204,16 @@ async function startServer() {
           vy?: number;
           lights?: boolean;
           z?: number;
+          color?: string;
         };
+
+        if (msg.type === 'color') {
+          // Only a colour nobody else on this level has; otherwise the sender keeps theirs
+          const taken = levelPlayers().some((other) => other.id !== id && other.color === msg.color);
+          if (isPlayerColor(msg.color) && !taken) player.color = msg.color;
+          broadcast({ type: 'color', id, color: player.color }, undefined, level);
+          return;
+        }
 
         if (msg.type !== 'update') {
           return;

@@ -37,13 +37,25 @@ export function getGridSlotPosition(slot: number): Point {
   };
 }
 
-/** A starting slot's position and car colour. */
+/** A starting slot's position. */
 export function getGridPlacement(slotIndex: number) {
-  return {
-    slotIndex,
-    color: PLAYER_COLORS[slotIndex % PLAYER_COLORS.length],
-    ...getGridSlotPosition(slotIndex),
-  };
+  return { slotIndex, ...getGridSlotPosition(slotIndex) };
+}
+
+export function isPlayerColor(color: unknown): color is string {
+  return typeof color === 'string' && PLAYER_COLORS.includes(color);
+}
+
+/**
+ * A car colour nobody else has: `preferred` if it is free, otherwise a random
+ * free one. With every colour taken, any colour will do.
+ */
+export function pickFreeColor(taken: Iterable<string>, preferred?: string | null, random = Math.random) {
+  const used = new Set(taken);
+  if (isPlayerColor(preferred) && !used.has(preferred)) return preferred;
+  const free = PLAYER_COLORS.filter((color) => !used.has(color));
+  const pool = free.length > 0 ? free : PLAYER_COLORS;
+  return pool[Math.floor(random() * pool.length)];
 }
 
 /** Lowest slot number nobody is using. */

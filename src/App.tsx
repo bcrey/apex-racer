@@ -16,6 +16,8 @@ import {
   getGridPlacement,
   getGridSlotPosition,
   HALF_TRACK_WIDTH,
+  PLAYER_COLORS,
+  pickFreeColor,
   START_FINISH_LINE_WIDTH,
   START_FINISH_X,
   START_FINISH_Y,
@@ -100,6 +102,8 @@ type PresencePlayer = NetworkCarState & {
   id: string;
   initials: string;
   color: string;
+  /** When this player took their colour; on a clash the earlier claim keeps it. */
+  colorAt?: number;
   slotIndex: number;
   lights?: boolean;
 };
@@ -110,6 +114,7 @@ type MultiplayerConnection = {
   close: () => void;
   sendUpdate: (update: CarUpdate) => void;
   broadcastLeaderboard: () => void;
+  changeColor: (color: string) => void;
 };
 
 type ConfettiParticle = {
@@ -167,6 +172,8 @@ const EASTER_EGG_INITIALS = 'SLY';
 const GRAPHICS_MODE_STORAGE_KEY = 'apex-racer:graphics';
 const LEVEL_STORAGE_KEY = 'apex-racer:level';
 const ADMIN_TOKEN_STORAGE_KEY = 'apex-racer:admin-token';
+/** The car colour this browser last picked, used again when it is free. */
+const COLOR_STORAGE_KEY = 'apex-racer:color';
 const HUD_UPDATE_INTERVAL_MS = 33;
 const LAP_FLASH_MS = 2500;
 const GHOST_COLOR = '#e2e8f0';
@@ -196,6 +203,14 @@ function loadLevel(): LevelId {
     return window.localStorage.getItem(LEVEL_STORAGE_KEY) === 'stunt' ? 'stunt' : 'circuit';
   } catch {
     return 'circuit';
+  }
+}
+
+function loadPreferredColor() {
+  try {
+    return window.localStorage.getItem(COLOR_STORAGE_KEY);
+  } catch {
+    return null;
   }
 }
 
@@ -599,6 +614,9 @@ export default function App() {
   const multiplayerRef = useRef<MultiplayerConnection | null>(null);
   const myIdRef = useRef<string | null>(null);
   const myColorRef = useRef<string>('#06b6d4');
+  const [myColor, setMyColorState] = useState(myColorRef.current);
+  /** Colours other drivers in the room have, so the picker can rule them out. */
+  const [takenColors, setTakenColors] = useState<string[]>([]);
   const remotePlayers = useRef<Map<string, RemoteCar>>(new Map());
   const lastSendTime = useRef<number>(0);
   const leaderboardRef = useRef<LeaderboardData>(emptyLeaderboardData());
@@ -710,6 +728,22 @@ export default function App() {
     void loadLeaderboard();
   }, [loadLeaderboard]);
 
+  const chooseColor = (color: string) => {
+    if (takenColors.includes(color)) return;
+    try {
+      window.localStorage.setItem(COLOR_STORAGE_KEY, color);
+    } catch {
+      // Not remembered for next time, but still applies now
+    }
+    const connection = multiplayerRef.current;
+    if (connection) {
+      connection.changeColor(color);
+    } else {
+      myColorRef.current = color;
+      setMyColorState(color);
+    }
+  };
+
   const toggleMute = useCallback(() => {
     const next = !sound.muted;
     sound.setMuted(next);
@@ -761,7 +795,16 @@ export default function App() {
     const prevCar = { x: c.x, y: c.y, angle: c.angle, z: 0 };
     // Height and jump state in Stunt Park; stays on the ground on the circuit
     let air = createAirState();
-    myColorRef.current = '#06b6d4';
+    const setMyColor = (color: string) => {
+      myColorRef.current = color;
+      setMyColorState(color);
+    };
+    const refreshTakenColors = () => {
+      setTakenColors([...remotePlayers.current.values()].map((player) => player.color));
+    };
+    // Offline, nobody else is driving, so any colour is free
+    setMyColor(pickFreeColor([], loadPreferredColor()));
+    setTakenColors([]);
     myIdRef.current = 'local';
     remotePlayers.current.clear();
     confettiParticles.current = [];
@@ -831,11 +874,13 @@ export default function App() {
       });
 
       remotePlayers.current = nextPlayers;
+      refreshTakenColors();
     };
 
     const setupLocalWebSocketConnection = () => {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}&level=${level}`;
+      const wsUrl = `${protocol}//${window.location.host}?initials=${encodeURIComponent(playerInitials)}&level=${level}`
+        + `&color=${encodeURIComponent(myColorRef.current)}`;
       const ws = new WebSocket(wsUrl);
 
       ws.onmessage = (event) => {
@@ -843,14 +888,21 @@ export default function App() {
           const msg = JSON.parse(event.data);
           if (msg.type === 'init') {
             myIdRef.current = msg.id;
-            myColorRef.current = msg.color;
+            setMyColor(msg.color);
             placeCar(msg.x, msg.y);
             remotePlayers.current.clear();
             msg.players.forEach((p: PresencePlayer) => {
               if (p.id !== msg.id) remotePlayers.current.set(p.id, createRemoteCar(p));
             });
+            refreshTakenColors();
           } else if (msg.type === 'join') {
             remotePlayers.current.set(msg.player.id, createRemoteCar(msg.player));
+            refreshTakenColors();
+          } else if (msg.type === 'color') {
+            const p = remotePlayers.current.get(msg.id);
+            if (msg.id === myIdRef.current) setMyColor(msg.color);
+            else if (p) p.color = msg.color;
+            refreshTakenColors();
           } else if (msg.type === 'update') {
             const p = remotePlayers.current.get(msg.id);
             if (p) {
@@ -860,6 +912,7 @@ export default function App() {
             void loadLeaderboard();
           } else if (msg.type === 'leave') {
             remotePlayers.current.delete(msg.id);
+            refreshTakenColors();
           }
         } catch (e) {
           console.error(e);
@@ -878,6 +931,9 @@ export default function App() {
           ws.send(JSON.stringify({ type: 'update', ...update }));
         },
         broadcastLeaderboard: () => {},
+        changeColor: (color: string) => {
+          if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'color', color }));
+        },
       } satisfies MultiplayerConnection;
     };
 
@@ -917,9 +973,31 @@ export default function App() {
         }
       });
 
+      // What this player shares through presence; set once subscribed
+      let me: PresencePlayer | null = null;
+      const claimColor = (color: string) => {
+        if (!me) return;
+        me = { ...me, color, colorAt: Date.now() };
+        setMyColor(color);
+        void channel.track(me);
+      };
+
       // Joins and leaves are always followed by a sync, which carries the full state
       channel.on('presence', { event: 'sync' }, () => {
-        syncRemotePlayersFromPresence(flattenPresencePlayers(channel.presenceState<PresencePlayer>()));
+        const players = flattenPresencePlayers(channel.presenceState<PresencePlayer>());
+        syncRemotePlayersFromPresence(players);
+        if (!me) return;
+
+        // Two drivers who joined or picked at the same moment can land on one
+        // colour. Whoever claimed it first keeps it; the other moves to a free one.
+        const mine = me;
+        const others = players.filter((player) => player.id !== playerId);
+        const claimedFirst = others.some((player) => player.color === mine.color
+          && ((player.colorAt ?? 0) < (mine.colorAt ?? 0)
+            || ((player.colorAt ?? 0) === (mine.colorAt ?? 0) && player.id < playerId)));
+        if (claimedFirst) {
+          claimColor(pickFreeColor(others.map((player) => player.color)));
+        }
       });
 
       await new Promise<void>((resolve, reject) => {
@@ -929,22 +1007,28 @@ export default function App() {
               const existingPlayers = flattenPresencePlayers(channel.presenceState<PresencePlayer>());
               const slotIndex = getFirstOpenSlot(existingPlayers.map((player) => player.slotIndex));
               const placement = getGridPlacement(slotIndex);
+              const color = pickFreeColor(
+                existingPlayers.map((player) => player.color),
+                loadPreferredColor(),
+              );
 
               myIdRef.current = playerId;
-              myColorRef.current = placement.color;
+              setMyColor(color);
               placeCar(placement.x, placement.y);
 
-              await channel.track({
+              me = {
                 id: playerId,
                 initials: playerInitials,
-                color: placement.color,
+                color,
+                colorAt: Date.now(),
                 slotIndex,
                 x: placement.x,
                 y: placement.y,
                 angle: 0,
                 vx: 0,
                 vy: 0,
-              } satisfies PresencePlayer);
+              };
+              await channel.track(me);
 
               resolve();
             } catch (trackError) {
@@ -977,6 +1061,7 @@ export default function App() {
             event: 'leaderboard',
           });
         },
+        changeColor: claimColor,
       } satisfies MultiplayerConnection;
     };
 
@@ -1955,6 +2040,38 @@ export default function App() {
     </div>
   );
 
+  const colorPicker = (
+    <div className="mb-4 flex items-start justify-between gap-3">
+      <span id="car-color-label" className="pt-1 text-xs uppercase tracking-widest text-gray-400">Car</span>
+      <div aria-labelledby="car-color-label" className="pointer-events-auto grid w-36 grid-cols-5 gap-1.5" role="radiogroup">
+        {PLAYER_COLORS.map((color) => {
+          const isMine = color === myColor;
+          const isTaken = !isMine && takenColors.includes(color);
+          return (
+            <button
+              aria-checked={isMine}
+              aria-label={isTaken ? `${color} (taken)` : color}
+              className={`relative h-6 rounded-full transition ${
+                isMine ? 'ring-2 ring-white ring-offset-2 ring-offset-black/80' : isTaken ? 'cursor-not-allowed opacity-25' : 'hover:scale-110'
+              }`}
+              disabled={isTaken}
+              key={color}
+              onClick={() => chooseColor(color)}
+              role="radio"
+              style={{ backgroundColor: color }}
+              title={isTaken ? 'Taken by another driver' : undefined}
+              type="button"
+            >
+              {isTaken && (
+                <span aria-hidden="true" className="absolute inset-0 flex items-center justify-center text-xs font-black text-black/70">×</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
   const renderStatRow = (label: string, value: string | null, colorClass: string) => (
     <div className="flex items-center justify-between gap-4 sm:gap-6">
       <span className="text-xs uppercase tracking-widest text-gray-400">{label}</span>
@@ -2022,6 +2139,7 @@ export default function App() {
       </h1>
       <p className="mb-4 text-xs font-medium text-gray-300 sm:text-sm">WASD or Arrows to drive, L for lights{isV2 && ', M for sound'}</p>
       {levelToggle}
+      {colorPicker}
       {graphicsToggle}
       {isV2 && soundToggle}
 
