@@ -1,7 +1,6 @@
 {
-  "rewrites": [
+  "redirects": [
     { "source": "/apexracer", "destination": "/" },
-    { "source": "/apexracer/", "destination": "/" },
-    { "source": "/apexracer/:path+", "destination": "/:path+" }
+    { "source": "/apexracer/:path*", "destination": "/:path*" }
   ]
 }
